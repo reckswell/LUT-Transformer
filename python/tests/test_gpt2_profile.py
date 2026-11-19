@@ -2,8 +2,9 @@
 Hugging Face's GPT2LMHeadModel (the imported ground truth).
 
 The tests here need the `transformers` package and skip without it. Only the last test needs the
-real pretrained weights; it skips unless they are already in checkpoints/ (or LUT_GPT2_DOWNLOAD=1
-allows downloading them, about 550 MB).
+real pretrained weights; it skips unless they are already in hf_gpt2.CHECKPOINT_DIR
+(../LUT-Transformer-local/checkpoints by default), or LUT_GPT2_DOWNLOAD=1 allows downloading them
+(about 550 MB) there.
 
 Tolerances: float64 rtol 1e-9 / atol 1e-9, as in test_model_against_reference.py (the two
 implementations add the same terms in a different order, about 1e-15 per operation). The real
@@ -86,10 +87,10 @@ def _pretrained_available() -> bool:
     return os.environ.get("LUT_GPT2_DOWNLOAD") == "1" or any(hf_gpt2.CHECKPOINT_DIR.glob("models--openai-community--gpt2*"))
 
 
-@pytest.mark.skipif(not _pretrained_available(), reason="GPT-2 weights not in checkpoints/ (set LUT_GPT2_DOWNLOAD=1 to fetch, about 550 MB)")
+@pytest.mark.skipif(not _pretrained_available(), reason="GPT-2 weights not in hf_gpt2.CHECKPOINT_DIR (set LUT_GPT2_DOWNLOAD=1 to fetch, about 550 MB)")
 def test_pretrained_gpt2_small_matches_hugging_face():
     cfg, params, hf_model = hf_gpt2.load_gpt2()
-    tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2", cache_dir=str(hf_gpt2.CHECKPOINT_DIR))
+    tokenizer = hf_gpt2.load_gpt2_tokenizer()
     ids = tokenizer("The quick brown fox jumps over the lazy dog because", return_tensors="pt").input_ids
     ours = host.forward(params, ids, host.base_ops(cfg, "inference"), cfg)
     with torch.no_grad():

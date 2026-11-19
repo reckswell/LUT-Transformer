@@ -15,7 +15,6 @@ Profiles so far: GPT-2 (openai-community/gpt2 and its larger sizes).
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +23,12 @@ from torch import Tensor
 
 from baseline import host
 
-REPO_DIR = Path(__file__).resolve().parents[2]
-# Where downloaded weights go: $LUT_CHECKPOINT_DIR if set (for example a folder outside the
-# repository for local binaries), otherwise checkpoints/ in the repository, which is gitignored.
-CHECKPOINT_DIR = Path(os.environ.get("LUT_CHECKPOINT_DIR", REPO_DIR / "checkpoints"))
+from reference.local_cache import CHECKPOINT_DIR, use_local_hf_cache
+
+# Downloaded weights, configs and tokenizer files go to CHECKPOINT_DIR, in
+# ../LUT-Transformer-local/checkpoints by default ($LUT_CHECKPOINT_DIR overrides it); Hugging
+# Face's own cache goes to ../LUT-Transformer-local/hf-home. Never the repository or ~/.cache
+# (Alpha, 2026-11-19). Every from_pretrained call below passes cache_dir=CHECKPOINT_DIR.
 
 
 # ----------------------------------------------------------------------------------------------
@@ -126,6 +127,7 @@ def load_gpt2(model_name: str = "openai-community/gpt2", *, device: str = "cpu",
     transformers 5 loads a checkpoint in its own stored dtype unless told otherwise (dtype="auto"),
     so the dtype is passed explicitly and then checked. Needs the `transformers` package.
     """
+    use_local_hf_cache()                 # raises if huggingface_hub's cache points anywhere else
     from transformers import GPT2LMHeadModel
 
     hf_model = GPT2LMHeadModel.from_pretrained(model_name, cache_dir=str(cache_dir), dtype=dtype).eval()
@@ -135,3 +137,12 @@ def load_gpt2(model_name: str = "openai-community/gpt2", *, device: str = "cpu",
     params = gpt2_params_from_hf(hf_model.state_dict(), cfg)
     params = {name: t.to(device=device, dtype=dtype) for name, t in params.items()}
     return cfg, params, hf_model
+
+
+def load_gpt2_tokenizer(model_name: str = "openai-community/gpt2", *, cache_dir: str | Path = CHECKPOINT_DIR) -> Any:
+    """GPT-2's byte-pair tokenizer from Hugging Face, downloaded once into CHECKPOINT_DIR. Its ids
+    are int64 indices into the 50,257-row token table. Needs the `transformers` package."""
+    use_local_hf_cache()
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model_name, cache_dir=str(cache_dir))

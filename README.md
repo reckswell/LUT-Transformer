@@ -32,3 +32,5 @@ python -m baseline.host info
 python -m LUT.host info
 python -m bench.run_benchmark --workload matmul --device cuda --size 4096 --power
 ```
+
+Downloaded models (GPT-2 small, about 550 MB) and Hugging Face's cache go to `../LUT-Transformer-local/` beside the repository, never into the repository or `~/.cache` (`python/reference/local_cache.py`; `LUT_LOCAL_DIR`, `LUT_CHECKPOINT_DIR` or `HF_HOME` override it). The real-weights GPT-2 test downloads them once with `LUT_GPT2_DOWNLOAD=1 pytest python/tests/test_gpt2_profile.py`.
