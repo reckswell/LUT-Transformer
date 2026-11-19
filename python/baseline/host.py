@@ -9,23 +9,28 @@ calls the same composition below with some stages switched to LUT functions.
 Which device runs which task (train, prefill, decode) comes from a hardware config.
 
     cd python
-    python -m baseline.host info     --model configs/model/tiny.yaml --hw configs/hw/gpu.yaml
+    python -m baseline.host info     --model configs/model/core.yaml --hw configs/hw/gpu.yaml
+    python -m baseline.host info     --model configs/model/gpt2.yaml
     python -m baseline.host train    ...same flags...
     python -m baseline.host evaluate ...
     python -m baseline.host generate ... --prompt "Once upon a time"
 
-Status: `info` works now. The model composition below is documented step by step and written
-in window 1, after Alpha settles the architecture decision (D1).
+Status: the inference composition (forward, prefill, decode_step, generate) and init_params work
+and are checked against reference_torch.py. Training (forward_train, backward, train_step) and the
+train / evaluate / generate commands come next; the commands also need a tokenizer and dataset (D2).
 """
 
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+import torch
 import yaml
+from torch import Tensor
 
 from baseline import inference, train
 
@@ -50,22 +55,32 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
 class TransformerConfig:
     """Model shape and architecture choices (configs/model/*.yaml).
 
-    Open decisions are marked DECISION in the yaml files and listed in the project plan.
+    The defaults are the barebones core (Alpha, 2026-11-19): the fewest components a decoder-only
+    transformer needs to train and to carry the attention claim. Every other component is an
+    option a model profile switches on; configs/model/gpt2.yaml is the first profile.
+
+      core default                    why it is the barebones choice
+      norm = rmsnorm                  one reduction per row and no shift (LayerNorm: two and a shift)
+      norm_placement = pre            trains stably at depth without warm-up tricks
+      activation = relu               a select on the sign bit; outputs are never negative
+      positional_encoding = sinusoidal  no learned table and no length limit ("none" is also allowed)
+      tie_embeddings = True           one V x D table serves as input embedding and output layer
+      bias = False                    no adds at accumulator width in the integer pipeline
     """
 
-    name: str = "tiny"
+    name: str = "core"
     vocab_size: int | None = None      # set from the tokenizer once the dataset is chosen
     context_length: int = 256
     d_model: int = 256
     n_heads: int = 4
     n_layers: int = 4
     d_ff: int = 1024
-    norm: str = "layernorm"            # layernorm | rmsnorm
+    norm: str = "rmsnorm"              # rmsnorm | layernorm
     norm_placement: str = "pre"        # pre | post
     activation: str = "relu"           # relu | gelu
-    positional_encoding: str = "sinusoidal"  # sinusoidal | learned
+    positional_encoding: str = "sinusoidal"  # sinusoidal | learned | none
     tie_embeddings: bool = True
-    bias: bool = True
+    bias: bool = False
     dropout: float = 0.0
 
     @property
@@ -81,8 +96,8 @@ class TransformerConfig:
             raise ValueError(f"activation must be relu or gelu, got {self.activation!r}")
         if self.norm_placement not in ("pre", "post"):
             raise ValueError(f"norm_placement must be pre or post, got {self.norm_placement!r}")
-        if self.positional_encoding not in ("sinusoidal", "learned"):
-            raise ValueError(f"positional_encoding must be sinusoidal or learned, got {self.positional_encoding!r}")
+        if self.positional_encoding not in ("sinusoidal", "learned", "none"):
+            raise ValueError(f"positional_encoding must be sinusoidal, learned or none, got {self.positional_encoding!r}")
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TransformerConfig":
@@ -133,7 +148,7 @@ STAGES: dict[str, str] = {**LAYER_STAGES, **MODEL_STAGES}
 
 
 def function_name(stage: str, cfg: TransformerConfig) -> str:
-    """The function a stage calls, for example "norm" -> "layernorm" under the tiny config."""
+    """The function a stage calls, for example "norm" -> "rmsnorm" under the core config."""
     return STAGES[stage].format(norm=cfg.norm, activation=cfg.activation)
 
 
@@ -182,22 +197,98 @@ def _get(module: Any, name: str) -> Callable[..., Any]:
 # Parameters
 # ----------------------------------------------------------------------------------------------
 
-def init_params(cfg: TransformerConfig, *, seed: int, device: str, dtype: Any = None) -> dict:
-    """Create every parameter as a plain tensor in one flat dict, named like the reference model
-    so weights can be copied in both directions (reference_torch.copy_params_*):
+def param_shapes(cfg: TransformerConfig) -> dict[str, tuple[int, ...]]:
+    """Every parameter's name and shape, in a fixed order, named like the reference model so
+    weights can be copied in both directions (reference_torch.copy_params_*):
 
         tok_emb                      (V, D)
         pos_emb                      (context_length, D)   only if positional_encoding = learned
         layers.{i}.norm1.gamma/beta  (D,)                  beta only for layernorm
         layers.{i}.attn.wq/wk/wv/wo  (D, D)                plus .bq/.bk/.bv/.bo (D,) if bias
         layers.{i}.norm2.gamma/beta  (D,)
-        layers.{i}.ffn.w1 (F, D), .b1 (F,), .w2 (D, F), .b2 (D,)
+        layers.{i}.ffn.w1 (F, D), .w2 (D, F)               plus .b1 (F,), .b2 (D,) if bias
         norm_f.gamma/beta            (D,)
         lm_head                      (V, D)                only if not tie_embeddings
 
-    DECISION (window 1): initialization scheme (for example normal(0, 0.02), scaled residual init).
+    Weight matrices are (D_out, D_in), the torch.nn.Linear layout that inference.linear expects.
     """
-    raise _todo("init_params")
+    if cfg.vocab_size is None:
+        raise ValueError("cfg.vocab_size must be set (it comes from the tokenizer)")
+    v, d, f = cfg.vocab_size, cfg.d_model, cfg.d_ff
+    shapes: dict[str, tuple[int, ...]] = {"tok_emb": (v, d)}
+    if cfg.positional_encoding == "learned":
+        shapes["pos_emb"] = (cfg.context_length, d)
+
+    def norm(prefix: str) -> None:
+        shapes[f"{prefix}.gamma"] = (d,)
+        if cfg.norm == "layernorm":
+            shapes[f"{prefix}.beta"] = (d,)
+
+    for i in range(cfg.n_layers):
+        p = f"layers.{i}"
+        norm(f"{p}.norm1")
+        for name in ("q", "k", "v", "o"):
+            shapes[f"{p}.attn.w{name}"] = (d, d)
+            if cfg.bias:
+                shapes[f"{p}.attn.b{name}"] = (d,)
+        norm(f"{p}.norm2")
+        shapes[f"{p}.ffn.w1"] = (f, d)
+        if cfg.bias:
+            shapes[f"{p}.ffn.b1"] = (f,)
+        shapes[f"{p}.ffn.w2"] = (d, f)
+        if cfg.bias:
+            shapes[f"{p}.ffn.b2"] = (d,)
+    norm("norm_f")
+    if not cfg.tie_embeddings:
+        shapes["lm_head"] = (v, d)
+    return shapes
+
+
+def _is_bias(name: str) -> bool:
+    """attn.bq/bk/bv/bo and ffn.b1/b2."""
+    last = name.rsplit(".", 1)[-1]
+    return last in ("bq", "bk", "bv", "bo", "b1", "b2")
+
+
+def init_params(cfg: TransformerConfig, *, seed: int, device: str = "cpu", dtype: Any = None) -> dict[str, Tensor]:
+    """Create every parameter in param_shapes(cfg) as a plain tensor in one flat dict.
+
+    Initialization, GPT-2's scheme (DECISION: a placeholder until Alpha picks one; it only
+    matters for training, since pretrained profiles load their own weights):
+      - every weight matrix and embedding ~ Normal(0, 0.02)
+      - the two projections that write into the residual stream (attn.wo and ffn.w2) ~
+        Normal(0, 0.02 / sqrt(2 * n_layers)). Each block adds two terms to the residual sum, so
+        scaling them down keeps the sum's variance from growing with depth.
+      - biases 0, norm gamma 1, norm beta 0 (so every norm starts as a plain standardization)
+    Random numbers come from one seeded CPU generator, drawn in param_shapes order, and are moved
+    to `device` afterwards, so the same seed gives the same weights on the CPU and the GPU.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    std, residual_std = 0.02, 0.02 / math.sqrt(2 * cfg.n_layers)
+    params: dict[str, Tensor] = {}
+    for name, shape in param_shapes(cfg).items():
+        if name.endswith(".gamma"):
+            t = torch.ones(shape)
+        elif name.endswith(".beta") or _is_bias(name):
+            t = torch.zeros(shape)
+        elif name.endswith(".attn.wo") or name.endswith(".ffn.w2"):
+            t = torch.randn(shape, generator=gen) * residual_std
+        else:
+            t = torch.randn(shape, generator=gen) * std
+        params[name] = t.to(device=device, dtype=dtype or torch.float32)
+    return params
+
+
+def count_params(cfg: TransformerConfig) -> dict[str, int]:
+    """Parameter counts from the shapes alone (nothing is allocated): the total, and the split
+    between embeddings (token, position and an untied output layer) and the decoder layers. A
+    tied embedding counts once."""
+    counts = {"embeddings": 0, "layers": 0, "final_norm": 0}
+    for name, shape in param_shapes(cfg).items():
+        group = "layers" if name.startswith("layers.") else "final_norm" if name.startswith("norm_f") else "embeddings"
+        counts[group] += math.prod(shape)
+    counts["total"] = sum(counts.values())
+    return counts
 
 
 # ----------------------------------------------------------------------------------------------
@@ -221,6 +312,100 @@ def init_params(cfg: TransformerConfig, *, seed: int, device: str, dtype: Any = 
 # then calls the *_backward functions in exactly the reverse order. Inference splits it into
 # prefill (the whole prompt at once, filling the KV cache) and decode (one token at a time,
 # reading the cache). Every function below takes `ops`, so the LUT host runs this same code.
+#
+# split_heads, merge_heads, causal_mask and the position codes are not stages: they re-index
+# tensors or build constants and do no arithmetic on activations, so they never get a LUT and are
+# called from baseline/inference.py directly.
+
+def _norm(fn: Callable, x: Tensor, params: dict, prefix: str, cfg: TransformerConfig) -> Tensor:
+    """Call a norm stage: LayerNorm takes (x, gamma, beta), RMSNorm takes (x, gamma)."""
+    if cfg.norm == "layernorm":
+        return fn(x, params[f"{prefix}.gamma"], params[f"{prefix}.beta"])
+    return fn(x, params[f"{prefix}.gamma"])
+
+
+def _embed(params: dict, token_ids: Tensor, start: int, ops: ModelOps, cfg: TransformerConfig) -> Tensor:
+    """x = token embedding + position code for tokens at absolute positions start .. start+T-1.
+    token_ids (B, T) -> (B, T, D). With positional_encoding = none, order comes only from the
+    causal mask."""
+    x = ops.embedding(token_ids, params["tok_emb"])
+    t = token_ids.shape[1]
+    if cfg.positional_encoding == "learned":
+        x = x + inference.learned_positions(t, params["pos_emb"], start)
+    elif cfg.positional_encoding == "sinusoidal":
+        x = x + inference.sinusoidal_positions(t, cfg.d_model, start, device=x.device, dtype=x.dtype)
+    return x
+
+
+def _attention(layer: dict, params: dict, prefix: str, h: Tensor, cfg: TransformerConfig,
+               cache: inference.KVCache | None, layer_index: int) -> Tensor:
+    """Multi-head causal self-attention on the normed input h (B, T, D). Returns (B, T, D).
+
+    With a cache, the new keys and values are appended first and the queries attend to every
+    cached position plus the new ones (offset = tokens already cached)."""
+    t = h.shape[1]
+    q = layer["qkv_proj"](h, params[f"{prefix}.wq"], params.get(f"{prefix}.bq"))   # (B, T, D)
+    k = layer["qkv_proj"](h, params[f"{prefix}.wk"], params.get(f"{prefix}.bk"))
+    v = layer["qkv_proj"](h, params[f"{prefix}.wv"], params.get(f"{prefix}.bv"))
+    q, k, v = (inference.split_heads(z, cfg.n_heads) for z in (q, k, v))           # (B, H, T, Dh)
+    offset = 0
+    if cache is not None:
+        offset = cache.length
+        k, v = cache.append(layer_index, k, v)                                      # (B, H, offset+T, Dh)
+    mask = inference.causal_mask(t, k.shape[2], offset, device=h.device)            # (T, offset+T)
+    s = layer["attn_scores"](q, k, mask)                                            # (B, H, T, offset+T)
+    probs = layer["softmax"](s)
+    a = layer["attn_values"](probs, v)                                              # (B, H, T, Dh)
+    return layer["out_proj"](inference.merge_heads(a), params[f"{prefix}.wo"], params.get(f"{prefix}.bo"))
+
+
+def _feed_forward(layer: dict, params: dict, prefix: str, h: Tensor) -> Tensor:
+    """down(act(up(h))): (B, T, D) -> (B, T, F) -> (B, T, D)."""
+    u = layer["ffn_up"](h, params[f"{prefix}.w1"], params.get(f"{prefix}.b1"))
+    return layer["ffn_down"](layer["ffn_act"](u), params[f"{prefix}.w2"], params.get(f"{prefix}.b2"))
+
+
+def _block(i: int, x: Tensor, params: dict, ops: ModelOps, cfg: TransformerConfig,
+           cache: inference.KVCache | None) -> Tensor:
+    """Decoder layer i: attention and feed-forward, each added to the residual stream x (B, T, D)."""
+    layer, p = ops.layers[i], f"layers.{i}"
+
+    def norm(z: Tensor, which: str) -> Tensor:
+        return _norm(layer["norm"], z, params, f"{p}.{which}", cfg)
+
+    if cfg.norm_placement == "pre":
+        x = x + _attention(layer, params, f"{p}.attn", norm(x, "norm1"), cfg, cache, i)
+        return x + _feed_forward(layer, params, f"{p}.ffn", norm(x, "norm2"))
+    x = norm(x + _attention(layer, params, f"{p}.attn", x, cfg, cache, i), "norm1")
+    return norm(x + _feed_forward(layer, params, f"{p}.ffn", x), "norm2")
+
+
+def _residual_stream(params: dict, token_ids: Tensor, ops: ModelOps, cfg: TransformerConfig,
+                     cache: inference.KVCache | None) -> Tensor:
+    """Embedding, then every decoder layer. Returns x (B, T, D) before the final norm. With a
+    cache, appends this step's keys and values and advances it by T."""
+    start = cache.length if cache is not None else 0
+    x = _embed(params, token_ids, start, ops, cfg)
+    for i in range(cfg.n_layers):
+        x = _block(i, x, params, ops, cfg, cache)
+    if cache is not None:
+        cache.advance(token_ids.shape[1])
+    return x
+
+
+def _head(params: dict, x: Tensor, ops: ModelOps, cfg: TransformerConfig) -> Tensor:
+    """Final norm, then the output layer: (..., D) -> logits (..., V). With tied embeddings the
+    output weight is the token table itself, logits = x @ tok_emb^T."""
+    h = _norm(ops.final_norm, x, params, "norm_f", cfg)
+    weight = params["tok_emb"] if cfg.tie_embeddings else params["lm_head"]
+    return ops.lm_head(h, weight)
+
+
+def forward(params: dict, token_ids: Tensor, ops: ModelOps, cfg: TransformerConfig) -> Tensor:
+    """The whole sequence at once with no cache: token_ids (B, T) -> logits (B, T, V) for every
+    position. Used for evaluation (perplexity) and to check against reference_torch."""
+    return _head(params, _residual_stream(params, token_ids, ops, cfg, None), ops, cfg)
+
 
 def forward_train(params: dict, token_ids: Any, ops: ModelOps, cfg: TransformerConfig) -> tuple[Any, list]:
     """Full forward pass with caches for backward. Returns (logits (B, T, V), caches)."""
@@ -239,22 +424,55 @@ def train_step(params: dict, batch: Any, ops: ModelOps, opt_state: dict, cfg: Tr
     raise _todo("train_step")
 
 
-def prefill(params: dict, token_ids: Any, cache: Any, ops: ModelOps, cfg: TransformerConfig) -> Any:
+def new_cache(params: dict, cfg: TransformerConfig, batch: int, max_len: int) -> inference.KVCache:
+    """An empty KV cache for `batch` sequences of up to max_len tokens, on the parameters' device
+    and dtype."""
+    ref = params["tok_emb"]
+    return inference.KVCache.allocate(cfg.n_layers, batch, cfg.n_heads, max_len, cfg.head_dim,
+                                      device=ref.device, dtype=ref.dtype)
+
+
+def prefill(params: dict, token_ids: Tensor, cache: inference.KVCache, ops: ModelOps, cfg: TransformerConfig) -> Tensor:
     """Run the prompt (B, T) through the model at once, filling the KV cache. Returns the last
-    position's logits (B, V)."""
-    raise _todo("prefill")
+    position's logits (B, V). Only the last position goes through the final norm and the output
+    layer, because generation needs nothing else (the output layer is the largest matmul in a
+    small model)."""
+    x = _residual_stream(params, token_ids, ops, cfg, cache)
+    return _head(params, x[:, -1], ops, cfg)
 
 
-def decode_step(params: dict, token_ids: Any, cache: Any, ops: ModelOps, cfg: TransformerConfig) -> Any:
+def decode_step(params: dict, token_ids: Tensor, cache: inference.KVCache, ops: ModelOps, cfg: TransformerConfig) -> Tensor:
     """Run one new token per sequence (B, 1) against the cache, appending its key and value.
-    Returns logits (B, V)."""
-    raise _todo("decode_step")
+    Returns logits (B, V). Each call reads the whole cache, so its attention cost grows with the
+    number of tokens so far."""
+    if token_ids.shape[1] != 1:
+        raise ValueError(f"decode_step takes one token per sequence, got shape {tuple(token_ids.shape)}")
+    x = _residual_stream(params, token_ids, ops, cfg, cache)
+    return _head(params, x[:, -1], ops, cfg)
 
 
-def generate(params: dict, prompt_ids: Any, max_new_tokens: int, ops: ModelOps, cfg: TransformerConfig, **sampling: Any) -> Any:
-    """prefill once, then decode_step + sample_next_token max_new_tokens times. Prefill and decode
-    may run on different devices (hardware config), with the cache moved between them."""
-    raise _todo("generate")
+def generate(params: dict, prompt_ids: Tensor, max_new_tokens: int, ops: ModelOps, cfg: TransformerConfig, *,
+             temperature: float = 1.0, top_k: int | None = None,
+             generator: torch.Generator | None = None) -> Tensor:
+    """prefill once, then sample_next_token + decode_step max_new_tokens times.
+    prompt_ids (B, T0) -> (B, T0 + max_new_tokens), the prompt followed by the new tokens.
+    temperature 0 is greedy. With learned positions, T0 + max_new_tokens may not exceed
+    context_length.
+
+    Everything runs on the parameters' device for now. Running prefill and decode on different
+    devices (the hardware config) means moving the cache between them; that comes with the
+    hardware split.
+    """
+    batch, t0 = prompt_ids.shape
+    cache = new_cache(params, cfg, batch, t0 + max_new_tokens)
+    tokens = [prompt_ids]
+    logits = prefill(params, prompt_ids, cache, ops, cfg)
+    for step in range(max_new_tokens):
+        next_id = inference.sample_next_token(logits, temperature, top_k, generator)[:, None]   # (B, 1)
+        tokens.append(next_id)
+        if step < max_new_tokens - 1:          # the last token doesn't need a forward pass
+            logits = decode_step(params, next_id, cache, ops, cfg)
+    return torch.cat(tokens, dim=1)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -264,7 +482,7 @@ def generate(params: dict, prompt_ids: Any, max_new_tokens: int, ops: ModelOps, 
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     """Flags shared by the baseline and LUT hosts."""
     parser.add_argument("command", choices=["info", "train", "evaluate", "generate"])
-    parser.add_argument("--model", default=str(PYTHON_DIR / "configs/model/tiny.yaml"))
+    parser.add_argument("--model", default=str(PYTHON_DIR / "configs/model/core.yaml"))
     parser.add_argument("--hw", default=str(PYTHON_DIR / "configs/hw/gpu.yaml"))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--prompt", default=None)
@@ -277,6 +495,12 @@ def _cmd_info(cfg: TransformerConfig, hw: dict) -> None:
     print(f"{'stage':<13}function")
     for stage in STAGES:
         print(f"{stage:<13}{function_name(stage, cfg)}")
+    if cfg.vocab_size is None:
+        print("\nparameters: vocab_size not set yet (it comes from the tokenizer)")
+    else:
+        counts = count_params(cfg)
+        print(f"\nparameters: {counts['total']:,} total = {counts['embeddings']:,} embeddings "
+              f"+ {counts['layers']:,} in {cfg.n_layers} layers + {counts['final_norm']:,} final norm")
     base_ops(cfg, "inference")   # raises if a function is missing
     base_ops(cfg, "train")
     print("\nall stage functions exist for inference and training")

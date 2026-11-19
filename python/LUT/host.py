@@ -144,12 +144,14 @@ def lut_ops(cfg: base.TransformerConfig, mode: base.Mode, toggles: dict[str, Sta
 
 
 # The composition itself is baseline/host.py's, run with lut_ops(...) in place of base_ops(...).
+forward = base.forward
 forward_train = base.forward_train
 backward = base.backward
 train_step = base.train_step
 prefill = base.prefill
 decode_step = base.decode_step
 generate = base.generate
+new_cache = base.new_cache
 
 
 # ----------------------------------------------------------------------------------------------

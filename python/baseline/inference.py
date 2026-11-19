@@ -1,30 +1,27 @@
 """Inference functions, non-LUT ("base") versions, written from mathematical base operations.
 
 Every function here is forward-only (no saved state for backward) and uses only basic tensor
-arithmetic: matmul (@), elementwise ops, reductions, exp, sqrt, indexing and reshapes. No
-torch.nn, torch.nn.functional or autograd. The LUT versions of the same functions live in
-python/LUT/inference_lut.py with identical signatures, and the toggles in python/LUT/host.py
-pick one per stage.
+arithmetic: matmul (@), elementwise ops (+, -, *, /, exp, sqrt, tanh, sin, cos, comparisons),
+reductions (sum, max), indexing and reshapes. No torch.nn, torch.nn.functional or autograd. The
+LUT versions of the same functions live in python/LUT/inference_lut.py with identical signatures,
+and the toggles in python/LUT/host.py pick one per stage.
 
 Shape names used in comments:
     B  batch size            T  sequence length (new tokens)     S  total length incl. cache
     D  model width (d_model) H  number of heads                  Dh head width = D / H
     F  feed-forward width    V  vocabulary size
 
-Status: signatures and documentation only. The bodies are written in window 1,
-each one tested against its torch.nn / torch.nn.functional equivalent.
+Each function is tested against its torch.nn / torch.nn.functional equivalent in
+python/tests/test_ops_against_torch.py.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
-
-
-def _todo(name: str) -> NotImplementedError:
-    return NotImplementedError(f"inference.{name} is written in window 1")
 
 
 # ----------------------------------------------------------------------------------------------
@@ -35,8 +32,12 @@ def embedding(token_ids: Tensor, table: Tensor) -> Tensor:
     """Look up each token's vector: x[b, t, :] = table[token_ids[b, t], :].
 
     token_ids: (B, T) integer ids.  table: (V, D).  Returns (B, T, D).
+
+    This is a plain row read, with no arithmetic. In hardware it is a memory read of one D-wide
+    row per token, which is why it is already "a LUT".
     """
-    raise _todo("embedding")
+    # Indexing a (V, D) tensor with a (B, T) integer tensor picks one row per id, giving (B, T, D).
+    return table[token_ids]
 
 
 def sinusoidal_positions(length: int, d_model: int, start: int = 0, *, device=None, dtype=None) -> Tensor:
@@ -45,14 +46,34 @@ def sinusoidal_positions(length: int, d_model: int, start: int = 0, *, device=No
     pe[p, 2i]   = sin(p / 10000^(2i / D))
     pe[p, 2i+1] = cos(p / 10000^(2i / D))
     Returns (length, D). `start` lets decode steps continue from the cached length.
-    DECISION (window 1): sinusoidal vs learned positions, see configs/model/.
+
+    Each pair of columns (2i, 2i+1) is a rotation at its own frequency w_i = 10000^(-2i/D), from
+    one turn per 2*pi positions (i = 0) down to one turn per about 2*pi*10000 positions.
     """
-    raise _todo("sinusoidal_positions")
+    dtype = dtype or torch.float32
+    # p: the absolute positions, as a column (length, 1).
+    p = torch.arange(start, start + length, device=device, dtype=torch.float64)[:, None]
+    # 2i for i = 0, 1, ...: the even column indices, as a row (1, ceil(D/2)).
+    two_i = torch.arange(0, d_model, 2, device=device, dtype=torch.float64)[None, :]
+    # w_i = 10000^(-2i/D) = exp(-(2i/D) * ln 10000). Computed in float64 so large positions keep
+    # their precision, then cast at the end.
+    w = torch.exp(-(two_i / d_model) * math.log(10000.0))
+    angle = p * w                                             # (length, ceil(D/2)), angle[p, i] = p * w_i
+    pe = torch.zeros(length, d_model, device=device, dtype=torch.float64)
+    pe[:, 0::2] = torch.sin(angle)                            # even columns
+    pe[:, 1::2] = torch.cos(angle[:, : d_model // 2])         # odd columns (one fewer if D is odd)
+    return pe.to(dtype)
 
 
 def learned_positions(length: int, table: Tensor, start: int = 0) -> Tensor:
-    """Learned position vectors: rows start .. start+length-1 of table (P_max, D). Returns (length, D)."""
-    raise _todo("learned_positions")
+    """Learned position vectors: rows start .. start+length-1 of table (P_max, D). Returns (length, D).
+
+    A learned table only covers P_max positions (GPT-2: 1,024); asking past the end is an error
+    rather than a silent wrap.
+    """
+    if start < 0 or start + length > table.shape[0]:
+        raise ValueError(f"positions {start}..{start + length - 1} are outside the table's {table.shape[0]} rows")
+    return table[start:start + length]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -62,24 +83,42 @@ def learned_positions(length: int, table: Tensor, start: int = 0) -> Tensor:
 def linear(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
     """Affine map y = x @ W^T + b.
 
+    y[..., o] = sum over i of x[..., i] * W[o, i], plus b[o].
+
     x: (..., D_in).  weight: (D_out, D_in), the same layout as torch.nn.Linear so weights can be
     copied from the reference model.  bias: (D_out,) or None.  Returns (..., D_out).
-    This is the main target for LUT replacement (see LUT/inference_lut.linear).
+    Cost: N * D_in * D_out multiply-accumulates for N rows of x. This is the main target for LUT
+    replacement (see LUT/inference_lut.linear), because W is fixed after training.
     """
-    raise _todo("linear")
+    # x (..., D_in) @ W^T (D_in, D_out) -> (..., D_out). matmul sums over the shared D_in axis.
+    y = x @ weight.transpose(0, 1)
+    if bias is not None:
+        y = y + bias                                          # (D_out,) broadcasts over the leading axes
+    return y
 
 
 def relu(x: Tensor) -> Tensor:
-    """ReLU: y = max(x, 0), elementwise."""
-    raise _todo("relu")
+    """ReLU: y = max(x, 0), elementwise.
+
+    In hardware this is the sign bit choosing between x and 0: no arithmetic at all.
+    """
+    return torch.where(x > 0, x, torch.zeros_like(x))
+
+
+# sqrt(2 / pi), the constant inside GELU's tanh approximation.
+_GELU_C = math.sqrt(2.0 / math.pi)
 
 
 def gelu(x: Tensor) -> Tensor:
     """GELU, tanh approximation: y = 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3))).
 
-    DECISION (window 1): ReLU vs GELU. ReLU is far cheaper in hardware.
+    The exact GELU is x * Phi(x), where Phi is the standard normal CDF. The tanh form is the
+    approximation GPT-2 was trained with (torch's F.gelu(approximate="tanh")); it differs from
+    the exact form by under about 1e-3. Either way, once the input is quantized to b bits the
+    whole function becomes a 2^b-entry table, so the choice of formula costs nothing in hardware.
     """
-    raise _todo("gelu")
+    inner = _GELU_C * (x + 0.044715 * x * x * x)              # sqrt(2/pi) * (x + 0.044715 x^3)
+    return 0.5 * x * (1.0 + torch.tanh(inner))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -91,16 +130,26 @@ def layernorm(x: Tensor, gamma: Tensor, beta: Tensor, eps: float = 1e-5) -> Tens
 
     mu = mean(x), var = mean((x - mu)^2), y = gamma * (x - mu) / sqrt(var + eps) + beta.
     x: (..., D).  gamma, beta: (D,).  Returns (..., D).
+
+    var is the biased (population) variance, dividing by D rather than D - 1, as torch does.
+    Two reductions per row (the mean, then the variance) and one reciprocal square root.
     """
-    raise _todo("layernorm")
+    d = x.shape[-1]
+    mu = x.sum(dim=-1, keepdim=True) / d                      # (..., 1) mean of each row
+    centered = x - mu                                         # (..., D)
+    var = (centered * centered).sum(dim=-1, keepdim=True) / d # (..., 1) mean squared deviation
+    x_hat = centered / torch.sqrt(var + eps)                  # (..., D) zero mean, unit variance
+    return gamma * x_hat + beta                               # per-feature scale and shift
 
 
 def rmsnorm(x: Tensor, gamma: Tensor, eps: float = 1e-6) -> Tensor:
     """RMSNorm over the last axis: y = gamma * x / sqrt(mean(x^2) + eps). No mean subtraction.
 
-    DECISION (window 1): LayerNorm vs RMSNorm. RMSNorm drops one reduction, cheaper in hardware.
+    One reduction per row instead of LayerNorm's two, and no shift (beta).
     """
-    raise _todo("rmsnorm")
+    d = x.shape[-1]
+    mean_sq = (x * x).sum(dim=-1, keepdim=True) / d           # (..., 1) mean of the squares
+    return gamma * (x / torch.sqrt(mean_sq + eps))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -108,13 +157,18 @@ def rmsnorm(x: Tensor, gamma: Tensor, eps: float = 1e-6) -> Tensor:
 # ----------------------------------------------------------------------------------------------
 
 def split_heads(x: Tensor, n_heads: int) -> Tensor:
-    """(B, T, D) -> (B, H, T, Dh): view the model width as H heads of width Dh = D / H."""
-    raise _todo("split_heads")
+    """(B, T, D) -> (B, H, T, Dh): view the model width as H heads of width Dh = D / H.
+
+    Head h owns columns h*Dh .. (h+1)*Dh - 1 of D. No arithmetic, only a re-indexing.
+    """
+    b, t, d = x.shape
+    return x.reshape(b, t, n_heads, d // n_heads).transpose(1, 2)
 
 
 def merge_heads(x: Tensor) -> Tensor:
-    """(B, H, T, Dh) -> (B, T, D): inverse of split_heads."""
-    raise _todo("merge_heads")
+    """(B, H, T, Dh) -> (B, T, D): inverse of split_heads (head h goes back to its Dh columns)."""
+    b, h, t, dh = x.shape
+    return x.transpose(1, 2).reshape(b, t, h * dh)
 
 
 def causal_mask(t_query: int, t_key: int, offset: int = 0, *, device=None) -> Tensor:
@@ -123,34 +177,54 @@ def causal_mask(t_query: int, t_key: int, offset: int = 0, *, device=None) -> Te
     Query i sits at absolute position offset + i, so it may see keys j <= offset + i.
     offset = number of tokens already in the KV cache (0 during prefill).
     """
-    raise _todo("causal_mask")
+    i = torch.arange(t_query, device=device)[:, None]         # (t_query, 1) query rows
+    j = torch.arange(t_key, device=device)[None, :]           # (1, t_key) key columns
+    return j <= i + offset
 
 
 def attention_scores(q: Tensor, k: Tensor, mask: Tensor | None = None) -> Tensor:
     """Scaled dot-product scores: s = (q @ k^T) / sqrt(Dh), masked positions set to -inf.
 
+    s[b, h, i, j] = sum over d of q[b, h, i, d] * k[b, h, j, d], divided by sqrt(Dh).
+
     q: (B, H, T, Dh).  k: (B, H, S, Dh).  mask: (T, S) boolean.  Returns (B, H, T, S).
-    Both operands come from the input at run time, so this cannot be folded into a fixed
-    weight table; it is the core of the LUT-attention question.
+    Cost: B * H * T * S * Dh multiply-accumulates. Both operands come from the input at run time,
+    so this cannot be folded into a fixed weight table; it is the core of the LUT-attention
+    question. The 1/sqrt(Dh) scale is kept as its own step so it stays visible when quantized;
+    with Dh = 64 it is 1/8, a 3-bit shift.
     """
-    raise _todo("attention_scores")
+    dh = q.shape[-1]
+    s = (q @ k.transpose(-2, -1)) / math.sqrt(dh)             # (B, H, T, Dh) @ (B, H, Dh, S)
+    if mask is not None:
+        # -inf becomes exactly 0 after softmax's exp, so masked keys get no weight.
+        s = torch.where(mask, s, torch.full_like(s, float("-inf")))
+    return s
 
 
 def softmax(scores: Tensor, dim: int = -1) -> Tensor:
     """Numerically stable softmax: p = exp(s - max(s)) / sum(exp(s - max(s))) along `dim`.
 
-    Subtracting the row max keeps exp() in range and doesn't change the result. Rows that are
-    fully masked (all -inf) are not expected; causal masks always leave the diagonal visible.
+    Subtracting the row max keeps exp() in range (every exponent is <= 0, so every term is in
+    (0, 1]) and doesn't change the result, because the common factor exp(-max) cancels between
+    the numerator and the sum. Per score: one subtract, one exp, one add into the row sum and one
+    divide. Rows that are fully masked (all -inf) give NaN, as in torch; causal masks always
+    leave the diagonal visible, so they don't occur.
     """
-    raise _todo("softmax")
+    m = scores.amax(dim=dim, keepdim=True)                    # row max
+    e = torch.exp(scores - m)                                 # in (0, 1]; masked entries -> 0
+    return e / e.sum(dim=dim, keepdim=True)
 
 
 def attention_values(probs: Tensor, v: Tensor) -> Tensor:
     """Weight the values by the attention probabilities: out = probs @ v.
 
+    out[b, h, i, d] = sum over j of probs[b, h, i, j] * v[b, h, j, d].
+
     probs: (B, H, T, S).  v: (B, H, S, Dh).  Returns (B, H, T, Dh).
+    Cost: B * H * T * S * Dh multiply-accumulates, the same as attention_scores. Like QK^T, both
+    operands are produced at run time.
     """
-    raise _todo("attention_values")
+    return probs @ v
 
 
 # ----------------------------------------------------------------------------------------------
@@ -163,7 +237,8 @@ class KVCache:
 
     keys[l], values[l]: (B, H, S_max, Dh) preallocated buffers; `length` = tokens filled so far.
     During decode every new token reads the whole cache, which is why attention cost grows with
-    context and is memory-bandwidth bound.
+    context and is memory-bandwidth bound: one decode step reads 2 * n_layers * B * H * length * Dh
+    cached values.
     """
 
     keys: list[Tensor] = field(default_factory=list)
@@ -173,18 +248,36 @@ class KVCache:
     @classmethod
     def allocate(cls, n_layers: int, batch: int, n_heads: int, max_len: int, head_dim: int,
                  *, device=None, dtype=None) -> "KVCache":
-        """Preallocate zeroed buffers for n_layers layers."""
-        raise _todo("KVCache.allocate")
+        """Preallocate zeroed buffers for n_layers layers. Preallocating (rather than
+        concatenating each step) mirrors the fixed on-chip or HBM buffer a hardware design has."""
+        shape = (batch, n_heads, max_len, head_dim)
+        return cls(
+            keys=[torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)],
+            values=[torch.zeros(shape, device=device, dtype=dtype) for _ in range(n_layers)],
+            length=0,
+        )
+
+    @property
+    def max_len(self) -> int:
+        return self.keys[0].shape[2] if self.keys else 0
 
     def append(self, layer: int, k_new: Tensor, v_new: Tensor) -> tuple[Tensor, Tensor]:
         """Write k_new, v_new (B, H, T, Dh) at positions length .. length+T-1 of `layer` and return
         views of all filled keys and values, (B, H, length+T, Dh). Call advance(T) after the last
         layer of a step."""
-        raise _todo("KVCache.append")
+        t = k_new.shape[2]
+        end = self.length + t
+        if end > self.max_len:
+            raise ValueError(f"KV cache full: {self.length} + {t} tokens > max_len {self.max_len}")
+        self.keys[layer][:, :, self.length:end] = k_new
+        self.values[layer][:, :, self.length:end] = v_new
+        return self.keys[layer][:, :, :end], self.values[layer][:, :, :end]
 
     def advance(self, n_tokens: int) -> None:
         """Mark n_tokens more positions as filled (once per forward step, after all layers)."""
-        raise _todo("KVCache.advance")
+        if self.length + n_tokens > self.max_len:
+            raise ValueError(f"KV cache full: {self.length} + {n_tokens} tokens > max_len {self.max_len}")
+        self.length += n_tokens
 
 
 def sample_next_token(logits: Tensor, temperature: float = 1.0, top_k: int | None = None,
@@ -193,5 +286,20 @@ def sample_next_token(logits: Tensor, temperature: float = 1.0, top_k: int | Non
 
     temperature == 0 means greedy argmax. Otherwise divide logits by temperature, keep the top_k
     largest if given, softmax, and draw one sample per row.
+
+    The draw is inverse-CDF sampling: with u ~ Uniform(0, 1) and c = cumsum(p), the sample is the
+    first index v with c[v] > u, which is the number of entries with c[v] <= u. Index v is chosen
+    with probability c[v] - c[v-1] = p[v].
     """
-    raise _todo("sample_next_token")
+    if temperature == 0:
+        return logits.argmax(dim=-1)
+    z = logits / temperature
+    if top_k is not None and top_k < z.shape[-1]:
+        kth_largest = torch.topk(z, top_k, dim=-1).values[..., -1:]       # (B, 1)
+        z = torch.where(z >= kth_largest, z, torch.full_like(z, float("-inf")))
+    p = softmax(z, dim=-1)                                                # (B, V)
+    c = torch.cumsum(p, dim=-1)                                           # (B, V), c[..., -1] ~= 1
+    u = torch.rand(p.shape[0], 1, generator=generator, device=p.device, dtype=p.dtype)
+    idx = (c <= u).sum(dim=-1)
+    # If rounding leaves c[-1] slightly below u, idx would be V; clamp to the last index.
+    return idx.clamp(max=p.shape[-1] - 1)

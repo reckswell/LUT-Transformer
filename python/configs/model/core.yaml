@@ -1,0 +1,18 @@
+# The barebones core (Alpha, 2026-11-19): the default architecture, at Track A size.
+# Every field is read by baseline/host.py:TransformerConfig, whose docstring says why each
+# component is the barebones choice. Real models are other files in this folder (profiles).
+name: core
+vocab_size: null              # set from the tokenizer once the dataset is chosen (D2)
+context_length: 256
+d_model: 256
+n_heads: 4                    # head width 64
+n_layers: 4
+d_ff: 1024
+
+norm: rmsnorm                 # rmsnorm | layernorm
+norm_placement: pre           # pre | post
+activation: relu              # relu | gelu
+positional_encoding: sinusoidal   # sinusoidal | learned | none
+tie_embeddings: true
+bias: false
+dropout: 0.0

@@ -87,7 +87,7 @@ def test_toggles_list_every_stage_and_describe_reports_table_size(dummy_arch):
 
 
 def test_repository_configs_load():
-    cfg, hw = base.load_configs(base.PYTHON_DIR / "configs/model/tiny.yaml", base.PYTHON_DIR / "configs/hw/gpu.yaml")
+    cfg, hw = base.load_configs(base.PYTHON_DIR / "configs/model/core.yaml", base.PYTHON_DIR / "configs/hw/gpu.yaml")
     assert cfg.head_dim * cfg.n_heads == cfg.d_model and hw["devices"]["decode"] == "cuda"
 
 
