@@ -4,6 +4,9 @@ reference trained with autograd and torch.optim.
 Float64 throughout, with rtol 1e-9 / atol 1e-9 as in test_model_against_reference.py: the two
 sides add the same terms in a different order (about 1e-15 per operation), so anything larger
 is a wrong gradient.
+
+Float64 here checks the math against a reference; it is not the base metric. Default runs are
+float32 with TF32 off (DTYPE, common/precision.py, tests/test_fp32_defaults.py).
 """
 
 import pytest

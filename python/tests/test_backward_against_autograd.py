@@ -5,6 +5,9 @@ backpropagates the same random upstream gradient, and compares. Everything is fl
 sides agree to about 1e-15, so the default float64 tolerances of torch.testing.assert_close
 (rtol 1e-7, atol 1e-7) would only pass a correct formula. The forward outputs are compared too,
 since train.py repeats the forward math on purpose (separate from inference.py).
+
+Float64 here checks the math against a reference; it is not the base metric. Default runs are
+float32 with TF32 off (DTYPE, common/precision.py, tests/test_fp32_defaults.py).
 """
 
 import math

@@ -1,6 +1,10 @@
 """From-scratch ops vs PyTorch. Forward is compared to torch.nn.functional in float32; backward
 is compared to autograd in float64. A test whose function is not written yet skips (via _call)
-until it is, then becomes the check that the function is right."""
+until it is, then becomes the check that the function is right.
+
+Float64 here checks the math against a reference; it is not the base metric. Default runs are
+float32 with TF32 off (DTYPE, common/precision.py, tests/test_fp32_defaults.py).
+"""
 
 import math
 

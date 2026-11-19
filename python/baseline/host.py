@@ -34,9 +34,16 @@ import yaml
 from torch import Tensor
 
 from baseline import inference, train
+from common import precision
 
 PYTHON_DIR = Path(__file__).resolve().parents[1]   # python/, where configs/ lives
 Mode = Literal["inference", "train"]
+
+# The float dtype of the parameters, and so of every activation, position code, KV cache entry and
+# logit computed from them. float32 is the base metric (Alpha, 2026-11-19): quantization comes
+# later (D4). Tests that check the math against references use float64 explicitly; that is a
+# check, not a different baseline. GPU runs also turn TF32 off (common/precision.py).
+DTYPE = torch.float32
 
 
 def _todo(name: str) -> NotImplementedError:
@@ -251,7 +258,7 @@ def _is_bias(name: str) -> bool:
     return last in ("bq", "bk", "bv", "bo", "b1", "b2")
 
 
-def init_params(cfg: TransformerConfig, *, seed: int, device: str = "cpu", dtype: Any = None) -> dict[str, Tensor]:
+def init_params(cfg: TransformerConfig, *, seed: int, device: str = "cpu", dtype: torch.dtype = DTYPE) -> dict[str, Tensor]:
     """Create every parameter in param_shapes(cfg) as a plain tensor in one flat dict.
 
     Initialization, GPT-2's scheme (DECISION: a placeholder until Alpha picks one; it only
@@ -263,6 +270,7 @@ def init_params(cfg: TransformerConfig, *, seed: int, device: str = "cpu", dtype
       - biases 0, norm gamma 1, norm beta 0 (so every norm starts as a plain standardization)
     Random numbers come from one seeded CPU generator, drawn in param_shapes order, and are moved
     to `device` afterwards, so the same seed gives the same weights on the CPU and the GPU.
+    Every tensor is created in `dtype` (DTYPE, float32, unless a test asks for float64).
     """
     gen = torch.Generator().manual_seed(seed)
     std, residual_std = 0.02, 0.02 / math.sqrt(2 * cfg.n_layers)
@@ -276,7 +284,7 @@ def init_params(cfg: TransformerConfig, *, seed: int, device: str = "cpu", dtype
             t = torch.randn(shape, generator=gen) * residual_std
         else:
             t = torch.randn(shape, generator=gen) * std
-        params[name] = t.to(device=device, dtype=dtype or torch.float32)
+        params[name] = t.to(device=device, dtype=dtype)
     return params
 
 
@@ -406,7 +414,11 @@ def _head(params: dict, x: Tensor, ops: ModelOps, cfg: TransformerConfig) -> Ten
 
 def forward(params: dict, token_ids: Tensor, ops: ModelOps, cfg: TransformerConfig) -> Tensor:
     """The whole sequence at once with no cache: token_ids (B, T) -> logits (B, T, V) for every
-    position. Used for evaluation (perplexity) and to check against reference/torch_model.py."""
+    position. Used for evaluation (perplexity) and to check against reference/torch_model.py.
+
+    token_ids are integer indices (int64) into the token table, not values: they pick rows of
+    tok_emb and are never converted to float or quantized. Everything computed from them has the
+    parameters' dtype (DTYPE, float32)."""
     return _head(params, _residual_stream(params, token_ids, ops, cfg, None), ops, cfg)
 
 
@@ -635,9 +647,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prompt", default=None)
 
 
-def _cmd_info(cfg: TransformerConfig, hw: dict) -> None:
+def _cmd_info(cfg: TransformerConfig, hw: dict, fp: dict) -> None:
     print(f"model   {cfg.name}: {asdict(cfg)}")
     print(f"hw      {hw.get('name', '?')}: {hw['devices']}")
+    print(f"dtype   {DTYPE}; float32 matmul precision {fp['float32_matmul_precision']}, "
+          f"TF32 {'on' if fp['cuda_matmul_allow_tf32'] or fp['cudnn_allow_tf32'] else 'off'}")
     print()
     print(f"{'stage':<13}function")
     for stage in STAGES:
@@ -658,9 +672,10 @@ def main(argv: list[str] | None = None) -> None:
     add_common_args(parser)
     args = parser.parse_args(argv)
 
+    fp = precision.full_fp32()          # full float32 math, no TF32, before anything runs
     cfg, hw = load_configs(args.model, args.hw)
     if args.command == "info":
-        _cmd_info(cfg, hw)
+        _cmd_info(cfg, hw, fp)
         return
     raise SystemExit(f"'{args.command}' is written in window 1. Try 'info' for now.")
 

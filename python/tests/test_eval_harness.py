@@ -4,6 +4,9 @@
   2. lut "all_base" vs baseline: bit-identical (torch.equal), as in test_lut_wiring.py.
   3. one stage set through a PARAMETERS global: wired through, but no LUT function exists until
      D5, so for now it must fail loudly rather than run the baseline silently.
+
+Float64 here checks the math against a reference; it is not the base metric. Default runs are
+float32 with TF32 off (DTYPE, common/precision.py, tests/test_fp32_defaults.py).
 """
 
 import math
@@ -58,7 +61,7 @@ def test_gpt2_arms_hf_baseline_and_lut():
     pytest.importorskip("transformers")
     from test_gpt2_profile import _small_hf_gpt2
 
-    weights = Weights.from_hf(_small_hf_gpt2(seed=4))
+    weights = Weights.from_hf(_small_hf_gpt2(seed=4), dtype=torch.float64)   # float64: checks the math
     ids = tokens(weights.cfg, batch=2, length=20, seed=9)
 
     hf = run_arm("hf", weights, ids, **FAST)

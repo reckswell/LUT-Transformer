@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+import torch
 from torch import Tensor
 
 from baseline import host
@@ -114,19 +115,23 @@ def gpt2_params_from_hf(state_dict: dict[str, Tensor], cfg: host.TransformerConf
     return {name: t.contiguous().clone() for name, t in params.items()}
 
 
-def load_gpt2(model_name: str = "openai-community/gpt2", *, device: str = "cpu", dtype: Any = None,
+def load_gpt2(model_name: str = "openai-community/gpt2", *, device: str = "cpu",
+              dtype: torch.dtype = host.DTYPE,
               cache_dir: str | Path = CHECKPOINT_DIR) -> tuple[host.TransformerConfig, dict[str, Tensor], Any]:
     """Load a pretrained GPT-2 from Hugging Face (downloaded once into CHECKPOINT_DIR).
 
     Returns (cfg, params, hf_model): our config, our parameter dict on `device`, and the
-    Hugging Face GPT2LMHeadModel itself (in eval mode, on the CPU) as the ground truth.
-    Needs the `transformers` package.
+    Hugging Face GPT2LMHeadModel itself (in eval mode, on the CPU) as the ground truth. Both are
+    in `dtype` (float32 by default, the base metric), so the two models compare like for like.
+    transformers 5 loads a checkpoint in its own stored dtype unless told otherwise (dtype="auto"),
+    so the dtype is passed explicitly and then checked. Needs the `transformers` package.
     """
-    import torch
     from transformers import GPT2LMHeadModel
 
-    hf_model = GPT2LMHeadModel.from_pretrained(model_name, cache_dir=str(cache_dir)).eval()
+    hf_model = GPT2LMHeadModel.from_pretrained(model_name, cache_dir=str(cache_dir), dtype=dtype).eval()
+    if next(hf_model.parameters()).dtype != dtype:
+        hf_model = hf_model.to(dtype)
     cfg = gpt2_config_from_hf(hf_model.config)
     params = gpt2_params_from_hf(hf_model.state_dict(), cfg)
-    params = {name: t.to(device=device, dtype=dtype or torch.float32) for name, t in params.items()}
+    params = {name: t.to(device=device, dtype=dtype) for name, t in params.items()}
     return cfg, params, hf_model

@@ -48,7 +48,7 @@ from torch import Tensor
 #   base.TransformerConfig, load_configs, add_common_args
 #       the model's shape and architecture options, read from the same YAML files, and the shared
 #       command-line flags. Both models describe the same transformer.
-#   base.param_shapes, init_params (used by tests and eval/, not here)
+#   base.param_shapes, init_params (init_params wrapped below with this file's DTYPE)
 #       the parameter names and layouts. The LUT model reads the same weights as the baseline, so
 #       the same trained or pretrained weights can run in every control arm; LUT tables are built
 #       from these weights.
@@ -65,6 +65,7 @@ from torch import Tensor
 #       model's wiring.
 from baseline import host as base
 from baseline import inference, train
+from common import precision
 from common.quant import QuantSpec  # noqa: F401  (for QuantSpec(...) in the stage lines below)
 from LUT import ops_registry
 from LUT.stages import BASE, LUTArch, Stage  # noqa: F401  (LUTArch: for the stage lines below)
@@ -73,10 +74,15 @@ from LUT.stages import BASE, LUTArch, Stage  # noqa: F401  (LUTArch: for the sta
 # PARAMETERS: edit these (like a SystemVerilog module's parameter list)
 # ==============================================================================================
 #
-# Shared numbers, used by the stage lines below. They only take effect in a stage that uses them;
-# with every stage on BASE they change nothing. Names map onto existing fields of QuantSpec
-# (common/quant.py) and LUTArch (LUT/stages.py).
+# Current setting (Alpha, 2026-11-19): every stage is BASE, so the model runs on plain float32
+# (DTYPE) everywhere and nothing is quantized. That is the base metric; quantization comes later.
+#
+# DTYPE is the float dtype of the parameters, activations, KV cache and logits, and so of every
+# stage input that isn't quantized. The other numbers only take effect in a stage line that uses
+# them; with every stage on BASE they change nothing. Their names map onto existing fields of
+# QuantSpec (common/quant.py) and LUTArch (LUT/stages.py).
 
+DTYPE          = torch.float32      # float dtype everywhere a stage isn't quantized (TF32 off: common/precision.py)
 DATA_BITS      = 8                  # QuantSpec.bits: integer width of a quantized stage input
 DATA_SIGNED    = True               # QuantSpec.signed: two's complement
                                     # (fraction bits / scales are part of decision D4; QuantSpec has
@@ -126,6 +132,12 @@ TRAIN_WITH_LUTS = False
 # ==============================================================================================
 # End of PARAMETERS
 # ==============================================================================================
+
+
+def init_params(cfg: base.TransformerConfig, *, seed: int, device: str = "cpu") -> dict[str, Tensor]:
+    """The LUT model's parameters: the baseline's names, layouts and initialization, created in
+    this file's DTYPE. The same seed gives the same weights as base.init_params at that dtype."""
+    return base.init_params(cfg, seed=seed, device=device, dtype=DTYPE)
 
 
 def parameter_toggles() -> dict[str, Stage]:
@@ -281,7 +293,9 @@ def _head(params: dict, x: Tensor, ops: base.ModelOps, cfg: base.TransformerConf
 
 
 def forward(params: dict, token_ids: Tensor, ops: base.ModelOps, cfg: base.TransformerConfig) -> Tensor:
-    """The whole sequence at once with no cache: token_ids (B, T) -> logits (B, T, V)."""
+    """The whole sequence at once with no cache: token_ids (B, T) -> logits (B, T, V).
+    token_ids are integer indices (int64) into the token table, not values; they are never
+    converted to float or quantized. Everything computed from them has the parameters' dtype."""
     return _head(params, _residual_stream(params, token_ids, ops, cfg, None), ops, cfg)
 
 
@@ -490,10 +504,12 @@ def train_step(params: dict, batch: Any, ops: base.ModelOps, opt_state: dict, cf
 # Command line
 # ----------------------------------------------------------------------------------------------
 
-def _cmd_info(cfg: base.TransformerConfig, hw: dict, preset: str) -> None:
+def _cmd_info(cfg: base.TransformerConfig, hw: dict, preset: str, fp: dict) -> None:
     chosen = preset_toggles(preset)
     print(f"model   {cfg.name}: n_layers {cfg.n_layers}, d_model {cfg.d_model}, norm {cfg.norm}, activation {cfg.activation}")
     print(f"hw      {hw.get('name', '?')}: {hw['devices']}")
+    print(f"dtype   {DTYPE}; float32 matmul precision {fp['float32_matmul_precision']}, "
+          f"TF32 {'on' if fp['cuda_matmul_allow_tf32'] or fp['cudnn_allow_tf32'] else 'off'}")
     print(f"preset  {preset}    train_with_luts: {TRAIN_WITH_LUTS}")
     print()
     print(f"{'stage':<13}{'runs':<26}{'k x b -> out':<14}{'table bits':>11}  {'layers':<8}quant")
@@ -514,9 +530,10 @@ def main(argv: list[str] | None = None) -> None:
                         help="which toggles to use (default: the PARAMETERS block)")
     args = parser.parse_args(argv)
 
+    fp = precision.full_fp32()          # full float32 math, no TF32, before anything runs
     cfg, hw = base.load_configs(args.model, args.hw)
     if args.command == "info":
-        _cmd_info(cfg, hw, args.preset)
+        _cmd_info(cfg, hw, args.preset, fp)
         return
     raise SystemExit(f"'{args.command}' is written in windows 1 and 2. Try 'info' for now.")
 

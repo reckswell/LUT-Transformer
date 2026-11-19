@@ -9,6 +9,9 @@ Tolerances: float64 rtol 1e-9 / atol 1e-9, as in test_model_against_reference.py
 implementations add the same terms in a different order, about 1e-15 per operation). The real
 weights are compared in float32 at atol 1e-3 on logits of size about 100: float32 rounding over
 12 layers of width 768 accumulates to about 1e-4 there.
+
+Float64 here checks the math against a reference; it is not the base metric. Default runs are
+float32 with TF32 off (DTYPE, common/precision.py, tests/test_fp32_defaults.py).
 """
 
 import os

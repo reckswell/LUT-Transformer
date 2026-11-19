@@ -9,6 +9,9 @@ Tolerances: float64 comparisons use rtol 1e-9 / atol 1e-9. The two models add th
 a different order, which in float64 moves results by about 1e-15 per operation, so anything
 above 1e-9 is a real difference. The float32 comparison uses rtol 1e-4 / atol 1e-4: a few layers
 of float32 rounding (about 1e-7 relative each) on logits of size about 1 stays well inside it.
+
+Float64 here checks the math against a reference; it is not the base metric. Default runs are
+float32 with TF32 off (DTYPE, common/precision.py, tests/test_fp32_defaults.py).
 """
 
 from dataclasses import replace

@@ -84,6 +84,11 @@ def _torch_info() -> dict[str, Any]:
         "cuda_build": torch.version.cuda,
         "cuda_available": torch.cuda.is_available(),
         "num_threads": torch.get_num_threads(),
+        # How float32 math runs (common/precision.py): full float32 unless TF32 is allowed.
+        "default_dtype": str(torch.get_default_dtype()),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
     }
     if torch.cuda.is_available():
         info["cudnn"] = torch.backends.cudnn.version()

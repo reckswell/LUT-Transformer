@@ -25,6 +25,9 @@ table shape and table bits). Cautions:
     loss function, so every arm is measured with the same stick.
   - Nothing here writes a run directory yet. The command that evaluates a dataset and logs a run
     under results/runs/ comes with the dataset and tokenizer (D2).
+  - Precision: every arm runs in float32 by default, the base metric (Alpha, 2026-11-19), with TF32
+    turned off (common/precision.py). Each result records the dtype and the precision flags.
+    Tests that check the math pass float64 weights on purpose.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from torch import Tensor
 
 from baseline import host as base
 from bench.timing import time_fn
+from common import precision
 from LUT import host as lut_host
 from LUT import ops_registry
 
@@ -58,12 +62,25 @@ class Weights:
     hf_model: Any | None = None
 
     @classmethod
-    def from_hf(cls, hf_model: Any) -> "Weights":
-        """Export a Hugging Face GPT-2's weights into our layout, keeping the model for the hf arm."""
+    def from_hf(cls, hf_model: Any, *, dtype: torch.dtype = base.DTYPE) -> "Weights":
+        """Export a Hugging Face GPT-2's weights into our layout, keeping the model for the hf arm.
+        Both are put in `dtype` (float32 by default). The Hugging Face model is converted in place
+        (torch's Module.to), so every arm runs at the same precision."""
         from reference import hf_gpt2   # needs transformers only when an hf model is given
 
+        hf_model = hf_model.to(dtype).eval()
         cfg = hf_gpt2.gpt2_config_from_hf(hf_model.config)
-        return cls(cfg, hf_gpt2.gpt2_params_from_hf(hf_model.state_dict(), cfg), hf_model.eval())
+        return cls(cfg, hf_gpt2.gpt2_params_from_hf(hf_model.state_dict(), cfg), hf_model)
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """The one float dtype every parameter (and the Hugging Face model, if any) is in."""
+        dtypes = {t.dtype for t in self.params.values()}
+        if self.hf_model is not None:
+            dtypes |= {p.dtype for p in self.hf_model.parameters()}
+        if len(dtypes) != 1:
+            raise ValueError(f"weights mix dtypes {sorted(map(str, dtypes))}; every arm must run at one precision")
+        return dtypes.pop()
 
 
 @dataclass
@@ -80,6 +97,8 @@ class ArmResult:
     arm: str
     preset: str | None
     device: str
+    dtype: str                    # the weights' and activations' dtype, "torch.float32" by default
+    precision: dict[str, Any]     # common/precision.precision_info() when the arm ran (TF32 flags)
     logits: Tensor
     loss: float
     perplexity: float
@@ -123,14 +142,22 @@ def run_arm(arm: str, weights: Weights, token_ids: Tensor, *, preset: str = "par
     preset applies to the lut arm only: "parameters" reads LUT/host.py's PARAMETERS block at this
     moment (so an override like lut_host.SOFTMAX = Stage(...) is picked up); other names are
     LUT/host.py PRESETS. repeats = 0 skips the timing.
+
+    token_ids are integer indices (int64) into the token table, not values; float token ids are
+    refused. TF32 is turned off first (common/precision.full_fp32), so float32 means full float32.
     """
+    if token_ids.dtype != torch.int64:
+        raise TypeError(f"token_ids must be int64 indices, got {token_ids.dtype}")
+    fp = precision.full_fp32()
+    dtype = weights.dtype
     run = _forward_fn(arm, weights, token_ids, preset)
     logits = run()
     loss = next_token_loss(logits, token_ids)
     device = str(token_ids.device)
     timing = time_fn(run, device=device, warmup=warmup, repeats=repeats).to_dict() if repeats else None
     cost = ops_registry.describe(lut_host.preset_toggles(preset), weights.cfg) if arm == "lut" else None
-    return ArmResult(arm=arm, preset=preset if arm == "lut" else None, device=device, logits=logits,
+    return ArmResult(arm=arm, preset=preset if arm == "lut" else None, device=device, dtype=str(dtype),
+                     precision=fp, logits=logits,
                      loss=loss, perplexity=float(torch.tensor(loss).exp()), timing=timing, modeled_cost=cost)
 
 

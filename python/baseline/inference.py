@@ -40,7 +40,7 @@ def embedding(token_ids: Tensor, table: Tensor) -> Tensor:
     return table[token_ids]
 
 
-def sinusoidal_positions(length: int, d_model: int, start: int = 0, *, device=None, dtype=None) -> Tensor:
+def sinusoidal_positions(length: int, d_model: int, start: int = 0, *, device=None, dtype=torch.float32) -> Tensor:
     """Fixed sinusoidal position codes for positions start .. start+length-1.
 
     pe[p, 2i]   = sin(p / 10000^(2i / D))
@@ -49,8 +49,9 @@ def sinusoidal_positions(length: int, d_model: int, start: int = 0, *, device=No
 
     Each pair of columns (2i, 2i+1) is a rotation at its own frequency w_i = 10000^(-2i/D), from
     one turn per 2*pi positions (i = 0) down to one turn per about 2*pi*10000 positions.
+    The table is a constant, worked out in float64 and rounded once to `dtype` (the activations'
+    dtype, float32 by default) at the end.
     """
-    dtype = dtype or torch.float32
     # p: the absolute positions, as a column (length, 1).
     p = torch.arange(start, start + length, device=device, dtype=torch.float64)[:, None]
     # 2i for i = 0, 1, ...: the even column indices, as a row (1, ceil(D/2)).

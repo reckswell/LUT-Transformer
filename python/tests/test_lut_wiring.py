@@ -14,6 +14,9 @@ in WIRING_MATCH_REASON what changed and why that tolerance is right.
 The other tests here check the PARAMETERS block (its globals are read when lut_ops runs, one
 stage changes without touching the others) and that LUT/host.py takes nothing from baseline/
 that is wiring.
+
+Float64 here checks the math against a reference; it is not the base metric. Default runs are
+float32 with TF32 off (DTYPE, common/precision.py, tests/test_fp32_defaults.py).
 """
 
 import ast
@@ -163,12 +166,12 @@ def test_parameters_block_comes_right_after_the_imports():
     # Like a SystemVerilog parameter list: only the docstring and imports sit above it.
     tree = ast.parse(LUT_HOST_FILE.read_text())
     for node in tree.body:
-        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "DATA_BITS" for t in node.targets):
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "DTYPE" for t in node.targets):
             break
         is_docstring = isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant)
         assert is_docstring or isinstance(node, (ast.Import, ast.ImportFrom)), f"line {node.lineno} sits above PARAMETERS"
     else:
-        pytest.fail("no DATA_BITS assignment: the PARAMETERS block is missing")
+        pytest.fail("no DTYPE assignment: the PARAMETERS block is missing")
     stage_globals = {stage.upper() for stage in base.STAGES}
     assert stage_globals <= set(vars(lut_host)), stage_globals - set(vars(lut_host))
 
@@ -179,7 +182,7 @@ def test_parameters_block_comes_right_after_the_imports():
 
 # Names LUT/host.py may use from baseline/, matching the reasons written at its imports.
 SHARED_FROM_BASELINE = {
-    "base": {"TransformerConfig", "Mode", "ModelOps", "STAGES", "load_configs", "add_common_args"},
+    "base": {"TransformerConfig", "Mode", "ModelOps", "STAGES", "load_configs", "add_common_args", "init_params"},
     "inference": {"KVCache", "split_heads", "merge_heads", "causal_mask", "sinusoidal_positions",
                   "learned_positions", "sample_next_token"},
     "train": {"cross_entropy_forward", "cross_entropy_backward", "clip_grad_norm", "adamw_step"},
