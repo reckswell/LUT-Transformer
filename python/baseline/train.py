@@ -115,6 +115,57 @@ def gelu_backward(dy: Tensor, cache: Cache) -> Tensor:
     return dy * (0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * du_dx)
 
 
+def silu_forward(x: Tensor) -> tuple[Tensor, Cache]:
+    """SiLU: y = x / (1 + exp(-x)) = x * sigmoid(x) (see inference.silu). Saves x and sigmoid(x)."""
+    e = torch.exp(-x)
+    return x / (1.0 + e), {"x": x, "sig": 1.0 / (1.0 + e)}
+
+
+def silu_backward(dy: Tensor, cache: Cache) -> Tensor:
+    """dx = dy * s (1 + x (1 - s)), with s = sigmoid(x).
+
+    Product rule on y = x s(x), using s'(x) = s (1 - s):  dy/dx = s + x s (1 - s) = s (1 + x (1 - s)).
+    """
+    x, s = cache["x"], cache["sig"]
+    return dy * (s * (1.0 + x * (1.0 - s)))
+
+
+def glu_gate_forward(a: Tensor, b: Tensor) -> tuple[Tensor, Cache]:
+    """y = a * b, elementwise (the GLU gate, see inference.glu_gate). Saves a and b."""
+    return a * b, {"a": a, "b": b}
+
+
+def glu_gate_backward(dy: Tensor, cache: Cache) -> tuple[Tensor, Tensor]:
+    """Return (da, db) = (dy * b, dy * a): each operand's gradient is dy times the other operand."""
+    return dy * cache["b"], dy * cache["a"]
+
+
+# ----------------------------------------------------------------------------------------------
+# Rotary positions
+# ----------------------------------------------------------------------------------------------
+
+def rope_forward(x: Tensor, cos: Tensor, sin: Tensor) -> tuple[Tensor, Cache]:
+    """Rotate each column pair (i, i + Dh/2) of x (B, H, T, Dh) by its position's angle (see
+    inference.rope): y1 = x1 cos - x2 sin, y2 = x2 cos + x1 sin. Saves cos and sin (T, Dh/2)."""
+    mid = x.shape[-1] // 2                                     # Dh/2, where the second half starts
+    x1, x2 = x[..., :mid], x[..., mid:]
+    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1), {"cos": cos, "sin": sin}
+
+
+def rope_backward(dy: Tensor, cache: Cache) -> Tensor:
+    """dx = the inverse rotation of dy (angle -p w_i), because a rotation is orthogonal:
+        dx1 = dy1 cos + dy2 sin
+        dx2 = dy2 cos - dy1 sin
+    From y1 = x1 c - x2 s and y2 = x2 c + x1 s: x1 reaches y1 through c and y2 through s, so
+    dL/dx1 = dy1 c + dy2 s; x2 reaches y1 through -s and y2 through c, so dL/dx2 = -dy1 s + dy2 c.
+    cos and sin are constants (a table of positions), so they get no gradient.
+    """
+    cos, sin = cache["cos"], cache["sin"]
+    mid = dy.shape[-1] // 2
+    dy1, dy2 = dy[..., :mid], dy[..., mid:]
+    return torch.cat((dy1 * cos + dy2 * sin, dy2 * cos - dy1 * sin), dim=-1)
+
+
 # ----------------------------------------------------------------------------------------------
 # Normalization
 # ----------------------------------------------------------------------------------------------

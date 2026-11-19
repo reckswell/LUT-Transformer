@@ -2,7 +2,8 @@
 as controls (decision D9).
 
 Arms:
-    "hf"        the Hugging Face model, exactly as `transformers` ships it (reference/hf_gpt2.py)
+    "hf"        the Hugging Face model, exactly as `transformers` ships it (reference/hf_gpt2.py,
+                reference/hf_llama.py)
     "baseline"  our from-scratch model (baseline/host.py)
     "lut"       our LUT model (LUT/host.py) with a set of toggles: "parameters" (its PARAMETERS
                 block, read when the arm runs) or a PRESETS name such as "all_base"
@@ -64,14 +65,15 @@ class Weights:
 
     @classmethod
     def from_hf(cls, hf_model: Any, *, dtype: torch.dtype = base.DTYPE) -> "Weights":
-        """Export a Hugging Face GPT-2's weights into our layout, keeping the model for the hf arm.
-        Both are put in `dtype` (float32 by default). The Hugging Face model is converted in place
-        (torch's Module.to), so every arm runs at the same precision."""
-        from reference import hf_gpt2   # needs transformers only when an hf model is given
+        """Export a Hugging Face model's weights into our layout (GPT-2 or Llama, through
+        reference/hf_profiles.py), keeping the model for the hf arm. Both are put in `dtype`
+        (float32 by default). The Hugging Face model is converted in place (torch's Module.to), so
+        every arm runs at the same precision."""
+        from reference import hf_profiles   # needs transformers only when an hf model is given
 
         hf_model = hf_model.to(dtype).eval()
-        cfg = hf_gpt2.gpt2_config_from_hf(hf_model.config)
-        return cls(cfg, hf_gpt2.gpt2_params_from_hf(hf_model.state_dict(), cfg), hf_model)
+        cfg, params = hf_profiles.export(hf_model)
+        return cls(cfg, params, hf_model)
 
     @property
     def dtype(self) -> torch.dtype:

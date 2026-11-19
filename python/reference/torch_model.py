@@ -9,8 +9,9 @@ Two jobs:
   2. Speed baseline: how fast library PyTorch runs the same model on the same hardware, so the
      cost of the from-scratch and LUT versions is measured against a fair reference.
 
-It mirrors TransformerConfig exactly (norm type and placement, activation, positional encoding,
-tied embeddings, bias) and uses the same parameter names as host.init_params, so copy_params_*
+It mirrors TransformerConfig exactly (norm type, eps and placement, activation, plain or gated
+feed-forward, positional encoding including rotary, tied embeddings, bias) and uses the same
+parameter names as host.init_params, so copy_params_*
 can move weights between the two. It deliberately shares no code with baseline/inference.py:
 everything here comes from torch.nn, torch.nn.functional and torch's own kernels, so a mistake
 in a from-scratch function cannot hide in both models at once.
@@ -27,10 +28,11 @@ from torch.nn import functional as F
 
 
 def _norm(cfg: Any) -> nn.Module:
-    """nn.LayerNorm (eps 1e-5, with a shift) or nn.RMSNorm (eps 1e-6, no shift), as cfg.norm says."""
+    """nn.LayerNorm (with a shift) or nn.RMSNorm (no shift), as cfg.norm says, with the config's eps
+    (cfg.norm_epsilon: norm_eps if set, else 1e-5 for LayerNorm and 1e-6 for RMSNorm)."""
     if cfg.norm == "layernorm":
-        return nn.LayerNorm(cfg.d_model, eps=1e-5)
-    return nn.RMSNorm(cfg.d_model, eps=1e-6)
+        return nn.LayerNorm(cfg.d_model, eps=cfg.norm_epsilon)
+    return nn.RMSNorm(cfg.d_model, eps=cfg.norm_epsilon)
 
 
 def _sinusoidal_table(length: int, d_model: int) -> Tensor:
@@ -44,13 +46,32 @@ def _sinusoidal_table(length: int, d_model: int) -> Tensor:
     return table   # float64; forward() casts it to the activations' dtype
 
 
+def _rotary_cos_sin(length: int, head_dim: int, theta: float, like: Tensor) -> tuple[Tensor, Tensor]:
+    """Rotary cos and sin for positions 0 .. length-1, each (length, Dh), written the way Hugging
+    Face's LlamaRotaryEmbedding writes it: inverse frequencies and angles in float32 (the constants
+    Llama checkpoints were trained with), the angles repeated over both halves of the head, then
+    cast to the activations' dtype. (baseline/inference.rope_tables builds the same constants its
+    own way, Dh/2 wide.)"""
+    inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    freqs = torch.outer(torch.arange(length, dtype=torch.float32), inv_freq)       # (length, Dh/2)
+    emb = torch.cat((freqs, freqs), dim=-1)                                         # (length, Dh)
+    return emb.cos().to(like.device, like.dtype), emb.sin().to(like.device, like.dtype)
+
+
+def _rotate_half(x: Tensor) -> Tensor:
+    """[x1, x2] -> [-x2, x1] over the last axis (Hugging Face's rotate_half)."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
 class Attention(nn.Module):
     """Multi-head causal self-attention from four nn.Linear layers and torch's fused
-    scaled_dot_product_attention kernel."""
+    scaled_dot_product_attention kernel, with rotary positions on q and k if the config asks."""
 
     def __init__(self, cfg: Any) -> None:
         super().__init__()
         self.n_heads = cfg.n_heads
+        self.rope_theta = cfg.rope_theta if cfg.positional_encoding == "rope" else None
         self.wq = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
         self.wk = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
         self.wv = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
@@ -60,21 +81,28 @@ class Attention(nn.Module):
         b, t, d = x.shape
         q, k, v = (proj(x).view(b, t, self.n_heads, d // self.n_heads).transpose(1, 2)
                    for proj in (self.wq, self.wk, self.wv))
+        if self.rope_theta is not None:
+            cos, sin = _rotary_cos_sin(t, d // self.n_heads, self.rope_theta, q)
+            q, k = q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
         out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.wo(out.transpose(1, 2).reshape(b, t, d))
 
 
 class FeedForward(nn.Module):
-    """w2(act(w1(x))): two nn.Linear layers with nn.ReLU or nn.GELU (tanh approximation) between."""
+    """w2(act(w1(x))) from nn.Linear layers and nn.ReLU, nn.GELU (tanh approximation) or nn.SiLU.
+    Gated (cfg.ffn = glu): w2(act(w1(x)) * w3(x)), which with SiLU is Llama's SwiGLU."""
 
     def __init__(self, cfg: Any) -> None:
         super().__init__()
         self.w1 = nn.Linear(cfg.d_model, cfg.d_ff, bias=cfg.bias)
         self.w2 = nn.Linear(cfg.d_ff, cfg.d_model, bias=cfg.bias)
-        self.act = nn.GELU(approximate="tanh") if cfg.activation == "gelu" else nn.ReLU()
+        self.w3 = nn.Linear(cfg.d_model, cfg.d_ff, bias=cfg.bias) if cfg.ffn == "glu" else None
+        self.act = {"gelu": nn.GELU(approximate="tanh"), "silu": nn.SiLU()}.get(cfg.activation, nn.ReLU())
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.w2(self.act(self.w1(x)))
+        if self.w3 is None:
+            return self.w2(self.act(self.w1(x)))
+        return self.w2(self.act(self.w1(x)) * self.w3(x))
 
 
 class Block(nn.Module):
@@ -121,6 +149,7 @@ class ReferenceTransformer(nn.Module):
             x = x + self.pos_emb(torch.arange(t, device=token_ids.device))
         elif self.cfg.positional_encoding == "sinusoidal":
             x = x + self.pos_table[:t].to(x.dtype)
+        # positional_encoding == "rope": rotary positions inside each Attention, nothing added here.
         # positional_encoding == "none": no position code; order comes from the causal mask only.
         for block in self.layers:
             x = block(x)
@@ -144,8 +173,10 @@ class ReferenceTransformer(nn.Module):
                 if linear.bias is not None:
                     named[f"{p}.attn.b{name[1]}"] = linear.bias
             named.update(_norm_params(f"{p}.norm2", block.norm2))
-            for name in ("w1", "w2"):
+            for name in ("w1", "w2", "w3"):
                 linear = getattr(block.ffn, name)
+                if linear is None:                       # w3 only in a gated feed-forward
+                    continue
                 named[f"{p}.ffn.{name}"] = linear.weight
                 if linear.bias is not None:
                     named[f"{p}.ffn.b{name[1]}"] = linear.bias

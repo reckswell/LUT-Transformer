@@ -138,6 +138,24 @@ def gelu(x: Tensor, *, arch: LUTArch, tables: Any = None) -> Tensor:
     raise _pending("gelu")
 
 
+def silu(x: Tensor, *, arch: LUTArch, tables: Any = None) -> Tensor:
+    """LUT version of inference.silu (Llama's activation): a table over the quantized input range."""
+    raise _pending("silu")
+
+
+def glu_gate(a: Tensor, b: Tensor, *, arch: LUTArch, tables: Any = None) -> Tensor:
+    """LUT version of inference.glu_gate, the elementwise product act(W1 h) * (W3 h) of a gated
+    feed-forward. Both operands are made at run time, so a table here is indexed by both (for
+    example 2 inputs of b bits: 2^(2b) entries)."""
+    raise _pending("glu_gate")
+
+
+def rope(x: Tensor, cos: Tensor, sin: Tensor, *, arch: LUTArch, tables: Any = None) -> Tensor:
+    """LUT version of inference.rope, the rotary rotation of q and k (4 multiplies per column
+    pair by constants from the position table)."""
+    raise _pending("rope")
+
+
 def layernorm(x: Tensor, gamma: Tensor, beta: Tensor, eps: float = 1e-5, *, arch: LUTArch, tables: Any = None) -> Tensor:
     """LUT version of inference.layernorm, for example a table for 1 / sqrt(var + eps)."""
     raise _pending("layernorm")

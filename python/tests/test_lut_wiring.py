@@ -184,7 +184,7 @@ def test_parameters_block_comes_right_after_the_imports():
 SHARED_FROM_BASELINE = {
     "base": {"TransformerConfig", "Mode", "ModelOps", "STAGES", "load_configs", "add_common_args", "init_params"},
     "inference": {"KVCache", "split_heads", "merge_heads", "causal_mask", "sinusoidal_positions",
-                  "learned_positions", "sample_next_token"},
+                  "learned_positions", "rope_tables", "sample_next_token"},
     "train": {"cross_entropy_forward", "cross_entropy_backward", "clip_grad_norm", "adamw_step"},
 }
 WIRING = ("forward", "new_cache", "prefill", "decode_step", "generate", "forward_train", "backward", "train_step")

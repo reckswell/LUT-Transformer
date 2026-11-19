@@ -57,8 +57,9 @@ from torch import Tensor
 #       the stage names the toggles refer to and the container that holds each stage's function.
 #       If the LUT wiring is restructured into different stages, give it its own list here.
 #   inference.KVCache, split_heads, merge_heads, causal_mask, sinusoidal_positions,
-#   learned_positions, sample_next_token
-#       helpers that re-index tensors, build constants, store the cache or pick the next token.
+#   learned_positions, rope_tables, sample_next_token
+#       helpers that re-index tensors, build constants (rope_tables: the rotary cos/sin table),
+#       store the cache or pick the next token.
 #       They do no arithmetic on activations, so they are not stages and never get a LUT.
 #   train.cross_entropy_forward / _backward, clip_grad_norm, adamw_step
 #       the loss and the optimizer: what training does with the model's output, not part of the
@@ -93,7 +94,9 @@ LUT_INPUT_BITS = 4                  # LUTArch.bits_per_input, b: address bits = 
 LUT_OUT_BITS   = 16                 # LUTArch.out_bits: width of one table entry
 LUT_ACC_BITS   = 24                 # LUTArch.acc_bits: integer accumulator for summed table outputs
 
-# One line per stage, in the order the model runs them. Each is BASE or
+# One line per stage, in the order the model runs them. A stage the model doesn't have (ROPE in a
+# model without rotary positions, FFN_GATE without a gated feed-forward) is listed as "not in this
+# model" by `info` and does nothing. Each is BASE or
 # Stage(lut=LUTArch(...), quant=QuantSpec(...), layers=(...)), and every field is optional:
 #   lut     a LUT architecture instead of the baseline function
 #   quant   quantize this stage's inputs (with or without a LUT); window 2, decision D4
@@ -111,12 +114,14 @@ LUT_ACC_BITS   = 24                 # LUTArch.acc_bits: integer accumulator for 
 EMBEDDING   = BASE   # embedding     token lookup             BASE | Stage(lut, quant)  (layers ignored)
 NORM        = BASE   # norm          LayerNorm or RMSNorm     BASE | Stage(lut, quant, layers)  (both norms in a layer)
 QKV_PROJ    = BASE   # qkv_proj      Q, K, V projections      BASE | Stage(lut, quant, layers)
+ROPE        = BASE   # rope          rotary rotation of Q, K  BASE | Stage(lut, quant, layers)  (rotary-position models only, e.g. Llama; 4 multiplies per pair)
 ATTN_SCORES = BASE   # attn_scores   QK^T / sqrt(Dh)          BASE | Stage(lut, quant, layers)  (both operands made at run time)
 SOFTMAX     = BASE   # softmax       exp, sum, divide         BASE | Stage(lut, quant, layers)
 ATTN_VALUES = BASE   # attn_values   PV                       BASE | Stage(lut, quant, layers)  (both operands made at run time)
 OUT_PROJ    = BASE   # out_proj      attention output         BASE | Stage(lut, quant, layers)
-FFN_UP      = BASE   # ffn_up        D -> F linear            BASE | Stage(lut, quant, layers)
-FFN_ACT     = BASE   # ffn_act       ReLU or GELU             BASE | Stage(lut, quant, layers)
+FFN_UP      = BASE   # ffn_up        D -> F linear (W1, W3)   BASE | Stage(lut, quant, layers)
+FFN_ACT     = BASE   # ffn_act       ReLU, GELU or SiLU       BASE | Stage(lut, quant, layers)
+FFN_GATE    = BASE   # ffn_gate      act(W1 h) * (W3 h)       BASE | Stage(lut, quant, layers)  (gated feed-forward only, e.g. Llama's SwiGLU; both operands made at run time)
 FFN_DOWN    = BASE   # ffn_down      F -> D linear            BASE | Stage(lut, quant, layers)
 FINAL_NORM  = BASE   # final_norm    norm before the output   BASE | Stage(lut, quant)  (layers ignored)
 LM_HEAD     = BASE   # lm_head       output layer             BASE | Stage(lut, quant)  (layers ignored; most of a small model's per-token compute)
@@ -146,12 +151,14 @@ def parameter_toggles() -> dict[str, Stage]:
     return {
         "norm": NORM,
         "qkv_proj": QKV_PROJ,
+        "rope": ROPE,
         "attn_scores": ATTN_SCORES,
         "softmax": SOFTMAX,
         "attn_values": ATTN_VALUES,
         "out_proj": OUT_PROJ,
         "ffn_up": FFN_UP,
         "ffn_act": FFN_ACT,
+        "ffn_gate": FFN_GATE,
         "ffn_down": FFN_DOWN,
         "embedding": EMBEDDING,
         "final_norm": FINAL_NORM,
@@ -198,12 +205,18 @@ def lut_ops(cfg: base.TransformerConfig, mode: base.Mode, toggles: dict[str, Sta
 #
 #   h  = L["norm"](x)                                  # norm1
 #   q, k, v = L["qkv_proj"](h, Wq), (h, Wk), (h, Wv)   # three projections, then split_heads
+#   q, k = L["rope"](q, cos, sin), L["rope"](k, cos, sin)   # rotary positions only (Llama)
 #   s  = L["attn_scores"](q, k, causal_mask)           # QK^T / sqrt(Dh), masked
 #   p  = L["softmax"](s)
 #   a  = L["attn_values"](p, v)                        # PV, then merge_heads
 #   x  = x + L["out_proj"](a, Wo)                      # residual
 #   h  = L["norm"](x)                                  # norm2
-#   x  = x + L["ffn_down"](L["ffn_act"](L["ffn_up"](h, W1)), W2)   # residual
+#   z  = L["ffn_act"](L["ffn_up"](h, W1))
+#   z  = L["ffn_gate"](z, L["ffn_up"](h, W3))          # gated feed-forward only (Llama's SwiGLU)
+#   x  = x + L["ffn_down"](z, W2)                      # residual
+#
+# With rotary positions, k is rotated before it goes into the KV cache, so the cache holds rotated
+# keys and a decode step only rotates its own new q and k.
 #
 # Whole model: tokens -> ops.embedding (+ positions) -> n_layers blocks -> ops.final_norm ->
 # ops.lm_head -> logits. Every stage is called through `ops`, never directly, so the toggles
@@ -211,15 +224,25 @@ def lut_ops(cfg: base.TransformerConfig, mode: base.Mode, toggles: dict[str, Sta
 # and, if it needs new stages, the stage list and LUT/ops_registry.py.
 
 def _norm(fn: Callable, x: Tensor, params: dict, prefix: str, cfg: base.TransformerConfig) -> Tensor:
-    """Call a norm stage: LayerNorm takes (x, gamma, beta), RMSNorm takes (x, gamma)."""
+    """Call a norm stage: LayerNorm takes (x, gamma, beta, eps), RMSNorm takes (x, gamma, eps)."""
     if cfg.norm == "layernorm":
-        return fn(x, params[f"{prefix}.gamma"], params[f"{prefix}.beta"])
-    return fn(x, params[f"{prefix}.gamma"])
+        return fn(x, params[f"{prefix}.gamma"], params[f"{prefix}.beta"], cfg.norm_epsilon)
+    return fn(x, params[f"{prefix}.gamma"], cfg.norm_epsilon)
+
+
+def _rope_tables(length: int, start: int, cfg: base.TransformerConfig, like: Tensor) -> tuple[Tensor, Tensor] | None:
+    """The rotary (cos, sin) tables for positions start .. start+length-1, each (length, Dh/2), on
+    like's device and dtype; None unless positional_encoding = rope. Built once per forward step
+    and shared by every layer, like a position ROM."""
+    if cfg.positional_encoding != "rope":
+        return None
+    return inference.rope_tables(length, cfg.head_dim, cfg.rope_theta, start, device=like.device, dtype=like.dtype)
 
 
 def _embed(params: dict, token_ids: Tensor, start: int, ops: base.ModelOps, cfg: base.TransformerConfig) -> Tensor:
     """x = token embedding + position code for tokens at absolute positions start .. start+T-1.
-    token_ids (B, T) -> (B, T, D)."""
+    token_ids (B, T) -> (B, T, D). Rotary positions add nothing here (they rotate q and k inside
+    attention)."""
     x = ops.embedding(token_ids, params["tok_emb"])
     t = token_ids.shape[1]
     if cfg.positional_encoding == "learned":
@@ -230,15 +253,18 @@ def _embed(params: dict, token_ids: Tensor, start: int, ops: base.ModelOps, cfg:
 
 
 def _attention(layer: dict, params: dict, prefix: str, h: Tensor, cfg: base.TransformerConfig,
-               cache: inference.KVCache | None, layer_index: int) -> Tensor:
+               cache: inference.KVCache | None, layer_index: int, rope: tuple[Tensor, Tensor] | None) -> Tensor:
     """Multi-head causal self-attention on the normed input h (B, T, D). Returns (B, T, D).
-    With a cache, the new keys and values are appended first and the queries attend to every
-    cached position plus the new ones (offset = tokens already cached)."""
+    rope is the (cos, sin) tables for these T positions, or None without rotary positions. With a
+    cache, the new keys and values are appended first and the queries attend to every cached
+    position plus the new ones (offset = tokens already cached)."""
     t = h.shape[1]
     q = layer["qkv_proj"](h, params[f"{prefix}.wq"], params.get(f"{prefix}.bq"))   # (B, T, D)
     k = layer["qkv_proj"](h, params[f"{prefix}.wk"], params.get(f"{prefix}.bk"))
     v = layer["qkv_proj"](h, params[f"{prefix}.wv"], params.get(f"{prefix}.bv"))
     q, k, v = (inference.split_heads(z, cfg.n_heads) for z in (q, k, v))           # (B, H, T, Dh)
+    if rope is not None:                                                            # rotate q and k, not v
+        q, k = layer["rope"](q, *rope), layer["rope"](k, *rope)
     offset = 0
     if cache is not None:
         offset = cache.length
@@ -250,14 +276,17 @@ def _attention(layer: dict, params: dict, prefix: str, h: Tensor, cfg: base.Tran
     return layer["out_proj"](inference.merge_heads(a), params[f"{prefix}.wo"], params.get(f"{prefix}.bo"))
 
 
-def _feed_forward(layer: dict, params: dict, prefix: str, h: Tensor) -> Tensor:
-    """down(act(up(h))): (B, T, D) -> (B, T, F) -> (B, T, D)."""
-    u = layer["ffn_up"](h, params[f"{prefix}.w1"], params.get(f"{prefix}.b1"))
-    return layer["ffn_down"](layer["ffn_act"](u), params[f"{prefix}.w2"], params.get(f"{prefix}.b2"))
+def _feed_forward(layer: dict, params: dict, prefix: str, h: Tensor, cfg: base.TransformerConfig) -> Tensor:
+    """mlp: down(act(up(h, W1))). glu: down(gate(act(up(h, W1)), up(h, W3))), which with SiLU is
+    Llama's SwiGLU. (B, T, D) -> (B, T, F) -> (B, T, D)."""
+    z = layer["ffn_act"](layer["ffn_up"](h, params[f"{prefix}.w1"], params.get(f"{prefix}.b1")))
+    if cfg.ffn == "glu":
+        z = layer["ffn_gate"](z, layer["ffn_up"](h, params[f"{prefix}.w3"], params.get(f"{prefix}.b3")))
+    return layer["ffn_down"](z, params[f"{prefix}.w2"], params.get(f"{prefix}.b2"))
 
 
 def _block(i: int, x: Tensor, params: dict, ops: base.ModelOps, cfg: base.TransformerConfig,
-           cache: inference.KVCache | None) -> Tensor:
+           cache: inference.KVCache | None, rope: tuple[Tensor, Tensor] | None) -> Tensor:
     """Decoder layer i: attention and feed-forward, each added to the residual stream x (B, T, D)."""
     layer, p = ops.layers[i], f"layers.{i}"
 
@@ -265,10 +294,10 @@ def _block(i: int, x: Tensor, params: dict, ops: base.ModelOps, cfg: base.Transf
         return _norm(layer["norm"], z, params, f"{p}.{which}", cfg)
 
     if cfg.norm_placement == "pre":
-        x = x + _attention(layer, params, f"{p}.attn", norm(x, "norm1"), cfg, cache, i)
-        return x + _feed_forward(layer, params, f"{p}.ffn", norm(x, "norm2"))
-    x = norm(x + _attention(layer, params, f"{p}.attn", x, cfg, cache, i), "norm1")
-    return norm(x + _feed_forward(layer, params, f"{p}.ffn", x), "norm2")
+        x = x + _attention(layer, params, f"{p}.attn", norm(x, "norm1"), cfg, cache, i, rope)
+        return x + _feed_forward(layer, params, f"{p}.ffn", norm(x, "norm2"), cfg)
+    x = norm(x + _attention(layer, params, f"{p}.attn", x, cfg, cache, i, rope), "norm1")
+    return norm(x + _feed_forward(layer, params, f"{p}.ffn", x, cfg), "norm2")
 
 
 def _residual_stream(params: dict, token_ids: Tensor, ops: base.ModelOps, cfg: base.TransformerConfig,
@@ -277,8 +306,9 @@ def _residual_stream(params: dict, token_ids: Tensor, ops: base.ModelOps, cfg: b
     cache, appends this step's keys and values and advances it by T."""
     start = cache.length if cache is not None else 0
     x = _embed(params, token_ids, start, ops, cfg)
+    rope = _rope_tables(token_ids.shape[1], start, cfg, x)       # None unless rotary positions
     for i in range(cfg.n_layers):
-        x = _block(i, x, params, ops, cfg, cache)
+        x = _block(i, x, params, ops, cfg, cache, rope)
     if cache is not None:
         cache.advance(token_ids.shape[1])
     return x
@@ -349,13 +379,14 @@ def generate(params: dict, prompt_ids: Tensor, max_new_tokens: int, ops: base.Mo
 #
 # In "train" mode every ops entry is a (forward, backward) pair. A residual add sends its
 # gradient both straight through and through the branch (the two are summed); the tied
-# embedding gets the sum of its input-lookup and output-layer gradients. split_heads and
+# embedding gets the sum of its input-lookup and output-layer gradients, and h gets the sum of
+# its W1 and W3 paths in a gated feed-forward. split_heads and
 # merge_heads are re-indexings, so each one's backward is the other.
 
 def _norm_forward(pair: tuple, x: Tensor, params: dict, prefix: str, cfg: base.TransformerConfig) -> tuple[Tensor, Any]:
     if cfg.norm == "layernorm":
-        return pair[0](x, params[f"{prefix}.gamma"], params[f"{prefix}.beta"])
-    return pair[0](x, params[f"{prefix}.gamma"])
+        return pair[0](x, params[f"{prefix}.gamma"], params[f"{prefix}.beta"], cfg.norm_epsilon)
+    return pair[0](x, params[f"{prefix}.gamma"], cfg.norm_epsilon)
 
 
 def _norm_backward(pair: tuple, dy: Tensor, cache: Any, prefix: str, grads: dict, cfg: base.TransformerConfig) -> Tensor:
@@ -376,7 +407,8 @@ def _linear_backward(pair: tuple, dy: Tensor, cache: Any, w_name: str, b_name: s
     return dx
 
 
-def _attention_train(layer: dict, params: dict, p: str, h: Tensor, cfg: base.TransformerConfig) -> tuple[Tensor, dict]:
+def _attention_train(layer: dict, params: dict, p: str, h: Tensor, cfg: base.TransformerConfig,
+                     rope: tuple[Tensor, Tensor] | None) -> tuple[Tensor, dict]:
     """Attention forward with caches (no KV cache: training sees whole sequences)."""
     t = h.shape[1]
     c: dict[str, Any] = {}
@@ -384,6 +416,9 @@ def _attention_train(layer: dict, params: dict, p: str, h: Tensor, cfg: base.Tra
     for name in ("q", "k", "v"):
         out, c[name] = layer["qkv_proj"][0](h, params[f"{p}.w{name}"], params.get(f"{p}.b{name}"))
         qkv[name] = inference.split_heads(out, cfg.n_heads)
+    if rope is not None:
+        qkv["q"], c["rope_q"] = layer["rope"][0](qkv["q"], *rope)
+        qkv["k"], c["rope_k"] = layer["rope"][0](qkv["k"], *rope)
     mask = inference.causal_mask(t, t, device=h.device)
     s, c["scores"] = layer["attn_scores"][0](qkv["q"], qkv["k"], mask)
     probs, c["softmax"] = layer["softmax"][0](s)
@@ -398,6 +433,8 @@ def _attention_backward(layer: dict, d_out: Tensor, c: dict, p: str, grads: dict
     d_probs, dv = layer["attn_values"][1](inference.split_heads(da, cfg.n_heads), c["values"])
     ds = layer["softmax"][1](d_probs, c["softmax"])
     dq, dk = layer["attn_scores"][1](ds, c["scores"])
+    if "rope_q" in c:                                    # undo the rotation (rope_backward)
+        dq, dk = layer["rope"][1](dq, c["rope_q"]), layer["rope"][1](dk, c["rope_k"])
     d_h = 0
     for name, d_heads in (("q", dq), ("k", dk), ("v", dv)):
         d_h = d_h + _linear_backward(layer["qkv_proj"], inference.merge_heads(d_heads), c[name],
@@ -405,18 +442,28 @@ def _attention_backward(layer: dict, d_out: Tensor, c: dict, p: str, grads: dict
     return d_h
 
 
-def _ffn_train(layer: dict, params: dict, p: str, h: Tensor) -> tuple[Tensor, dict]:
+def _ffn_train(layer: dict, params: dict, p: str, h: Tensor, cfg: base.TransformerConfig) -> tuple[Tensor, dict]:
     c: dict[str, Any] = {}
     u, c["up"] = layer["ffn_up"][0](h, params[f"{p}.w1"], params.get(f"{p}.b1"))
     z, c["act"] = layer["ffn_act"][0](u)
+    if cfg.ffn == "glu":
+        u3, c["up3"] = layer["ffn_up"][0](h, params[f"{p}.w3"], params.get(f"{p}.b3"))
+        z, c["gate"] = layer["ffn_gate"][0](z, u3)
     out, c["down"] = layer["ffn_down"][0](z, params[f"{p}.w2"], params.get(f"{p}.b2"))
     return out, c
 
 
-def _ffn_backward(layer: dict, d_out: Tensor, c: dict, p: str, grads: dict) -> Tensor:
+def _ffn_backward(layer: dict, d_out: Tensor, c: dict, p: str, grads: dict, cfg: base.TransformerConfig) -> Tensor:
+    """Reverse of _ffn_train. Returns d_h; with a gate, h fed both W1 and W3, so both paths add."""
     dz = _linear_backward(layer["ffn_down"], d_out, c["down"], f"{p}.w2", f"{p}.b2", grads)
+    if cfg.ffn == "glu":
+        dz, du3 = layer["ffn_gate"][1](dz, c["gate"])    # dz now is d(act output), du3 is d(W3 h)
+        d_h3 = _linear_backward(layer["ffn_up"], du3, c["up3"], f"{p}.w3", f"{p}.b3", grads)
     du = layer["ffn_act"][1](dz, c["act"])
-    return _linear_backward(layer["ffn_up"], du, c["up"], f"{p}.w1", f"{p}.b1", grads)
+    d_h = _linear_backward(layer["ffn_up"], du, c["up"], f"{p}.w1", f"{p}.b1", grads)
+    if cfg.ffn == "glu":
+        d_h = d_h + d_h3
+    return d_h
 
 
 def forward_train(params: dict, token_ids: Tensor, ops: base.ModelOps, cfg: base.TransformerConfig) -> tuple[Tensor, dict]:
@@ -430,19 +477,20 @@ def forward_train(params: dict, token_ids: Tensor, ops: base.ModelOps, cfg: base
         x = x + params["pos_emb"][:t]
     elif cfg.positional_encoding == "sinusoidal":
         x = x + inference.sinusoidal_positions(t, cfg.d_model, device=x.device, dtype=x.dtype)
+    rope = _rope_tables(t, 0, cfg, x)                    # None unless rotary positions
     for i in range(cfg.n_layers):
         layer, p, c = ops.layers[i], f"layers.{i}", {}
         if cfg.norm_placement == "pre":
             h, c["norm1"] = _norm_forward(layer["norm"], x, params, f"{p}.norm1", cfg)
-            attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", h, cfg)
+            attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", h, cfg, rope)
             x = x + attn
             h, c["norm2"] = _norm_forward(layer["norm"], x, params, f"{p}.norm2", cfg)
-            ffn, c["ffn"] = _ffn_train(layer, params, f"{p}.ffn", h)
+            ffn, c["ffn"] = _ffn_train(layer, params, f"{p}.ffn", h, cfg)
             x = x + ffn
         else:
-            attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", x, cfg)
+            attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", x, cfg, rope)
             x, c["norm1"] = _norm_forward(layer["norm"], x + attn, params, f"{p}.norm1", cfg)
-            ffn, c["ffn"] = _ffn_train(layer, params, f"{p}.ffn", x)
+            ffn, c["ffn"] = _ffn_train(layer, params, f"{p}.ffn", x, cfg)
             x, c["norm2"] = _norm_forward(layer["norm"], x + ffn, params, f"{p}.norm2", cfg)
         caches["layers"].append(c)
     h, caches["final_norm"] = _norm_forward(ops.final_norm, x, params, "norm_f", cfg)
@@ -461,7 +509,7 @@ def backward(d_logits: Tensor, caches: dict, ops: base.ModelOps, cfg: base.Trans
         layer, p, c = ops.layers[i], f"layers.{i}", caches["layers"][i]
         if cfg.norm_placement == "pre":
             # x_out = x_mid + ffn(norm2(x_mid)): dx reaches x_mid directly and through the branch.
-            d_branch = _ffn_backward(layer, dx, c["ffn"], f"{p}.ffn", grads)
+            d_branch = _ffn_backward(layer, dx, c["ffn"], f"{p}.ffn", grads, cfg)
             dx = dx + _norm_backward(layer["norm"], d_branch, c["norm2"], f"{p}.norm2", grads, cfg)
             # x_mid = x_in + attn(norm1(x_in))
             d_branch = _attention_backward(layer, dx, c["attn"], f"{p}.attn", grads, cfg)
@@ -469,7 +517,7 @@ def backward(d_logits: Tensor, caches: dict, ops: base.ModelOps, cfg: base.Trans
         else:
             # x_out = norm2(x_mid + ffn(x_mid)), then x_mid = norm1(x_in + attn(x_in))
             d_sum = _norm_backward(layer["norm"], dx, c["norm2"], f"{p}.norm2", grads, cfg)
-            dx = d_sum + _ffn_backward(layer, d_sum, c["ffn"], f"{p}.ffn", grads)
+            dx = d_sum + _ffn_backward(layer, d_sum, c["ffn"], f"{p}.ffn", grads, cfg)
             d_sum = _norm_backward(layer["norm"], dx, c["norm1"], f"{p}.norm1", grads, cfg)
             dx = d_sum + _attention_backward(layer, d_sum, c["attn"], f"{p}.attn", grads, cfg)
     d_table = ops.embedding[1](dx, caches["embedding"])
@@ -506,7 +554,8 @@ def train_step(params: dict, batch: Any, ops: base.ModelOps, opt_state: dict, cf
 
 def _cmd_info(cfg: base.TransformerConfig, hw: dict, preset: str, fp: dict) -> None:
     chosen = preset_toggles(preset)
-    print(f"model   {cfg.name}: n_layers {cfg.n_layers}, d_model {cfg.d_model}, norm {cfg.norm}, activation {cfg.activation}")
+    print(f"model   {cfg.name}: n_layers {cfg.n_layers}, d_model {cfg.d_model}, norm {cfg.norm}, "
+          f"activation {cfg.activation}, ffn {cfg.ffn}, positions {cfg.positional_encoding}")
     print(f"hw      {hw.get('name', '?')}: {hw['devices']}")
     print(f"dtype   {DTYPE}; float32 matmul precision {fp['float32_matmul_precision']}, "
           f"TF32 {'on' if fp['cuda_matmul_allow_tf32'] or fp['cudnn_allow_tf32'] else 'off'}")

@@ -10,8 +10,11 @@
 #   datasets    wikitext2, tinystories (common/data.py); used by perplexity, ignored by speed
 #   batch, context_lengths, decode_tokens, repeats: speed only
 # Models load only from ../LUT-Transformer-local/checkpoints. Installed: gpt2 (openai-community/gpt2, 124M) and
-# stories15m (Xenova/llama2.c-stories15M: Karpathy's 15.2M-parameter Llama trained on TinyStories; hf arm only
-# until our from-scratch arms get a Llama profile).
+# stories15m (Xenova/llama2.c-stories15M: Karpathy's 15.2M-parameter Llama trained on TinyStories). Every arm runs
+# both (our arms through the GPT-2 and Llama profiles in reference/).
+# The research rows at the bottom (Alpha's list, 2026-11-19) are off and not downloaded: hf arm only, with the
+# download size and the published scores in notes (as reported, not measured by us). Enabling one needs Alpha's
+# OK to download it (--download). Scores for benchmarks the sweep doesn't run (accuracy) are only in notes.
 # datasets only from ../LUT-Transformer-local/datasets (none downloaded yet, so the perplexity rows are off).
 # The GPU rows start off too: set enabled to yes when the GPU is free.
 enabled,name,arm,model,weights,lut_preset,device,benchmarks,datasets,batch,context_lengths,decode_tokens,repeats,notes
@@ -21,10 +24,19 @@ yes,gpt2_hf_cpu,hf,gpt2,pretrained,,cpu,speed,,1,128;512,32,5,Hugging Face GPT-2
 yes,gpt2_base_cpu,baseline,gpt2,pretrained,,cpu,speed,,1,128;512,32,5,our from-scratch model on GPT-2's weights
 no,core_trained_tinystories,baseline,core,train,,cpu,perplexity,tinystories,,,,,Track A (the core trained on TinyStories): not needed while stories15m (already trained on TinyStories) is the small baseline
 yes,stories15m_hf_cpu,hf,stories15m,pretrained,,cpu,speed,,1,64;224,32,5,small pretrained baseline (Alpha 2026-11-19); trained with 256-token context
+yes,stories15m_base_cpu,baseline,stories15m,pretrained,,cpu,speed,,1,64;224,32,5,our from-scratch model on stories15M's weights (Llama profile)
+yes,stories15m_lut_allbase_cpu,lut,stories15m,pretrained,all_base,cpu,speed,,1,64;224,32,5,LUT wiring with every stage on BASE (control: should match stories15m_base_cpu)
 no,stories15m_hf_ppl_cpu,hf,stories15m,pretrained,,cpu,perplexity,tinystories,,,,,needs the TinyStories dataset (--download)
+no,stories15m_base_ppl_cpu,baseline,stories15m,pretrained,,cpu,perplexity,tinystories,,,,,should match stories15m_hf_ppl_cpu; needs the TinyStories dataset
 no,gpt2_hf_ppl_gpu,hf,gpt2,pretrained,,cuda,perplexity,wikitext2;tinystories,,,,,needs the datasets (--download) and pyarrow for wikitext2
 no,gpt2_base_ppl_gpu,baseline,gpt2,pretrained,,cuda,perplexity,wikitext2;tinystories,,,,,should match gpt2_hf_ppl_gpu
 no,gpt2_hf_gpu,hf,gpt2,pretrained,,cuda,speed,,1,128;512;992,32,10,
 no,gpt2_base_gpu,baseline,gpt2,pretrained,,cuda,speed,,1,128;512;992,32,10,
 no,stories15m_hf_gpu,hf,stories15m,pretrained,,cuda,speed,,1,64;224,32,10,
+no,stories15m_base_gpu,baseline,stories15m,pretrained,,cuda,speed,,1,64;224,32,10,
 no,core_base_gpu_long,baseline,core,random,,cuda,speed,,1,1024;4096;16384,32,5,decode time per token against context length
+no,gpt2-xl_hf_gpu,hf,openai-community/gpt2-xl,pretrained,,cuda,speed;perplexity,wikitext2,1,128;512;992,32,10,"research list; 1.5B, download 6.4 GB; published (GPT-2 paper, zero-shot): WikiText-2 ppl 18.34, PTB ppl 35.76, LAMBADA acc 63.24; our wikitext2 perplexity uses a stride-W/2 window, not the paper's setup"
+no,opt-125m_hf_cpu,hf,facebook/opt-125m,pretrained,,cpu,speed;perplexity,wikitext2,1,128;512,32,5,"research list; 125M, download 0.25 GB; published: WikiText-2 ppl 27.65 (FP16); OPT architecture is hf-arm only (untested until downloaded)"
+no,stories42m_hf_cpu,hf,Xenova/llama2.c-stories42M,pretrained,,cpu,speed;perplexity,tinystories,1,64;224,32,5,"research list; 42M Llama on TinyStories, download 167 MB (Karpathy's original: karpathy/tinyllamas stories42M.pt); published: TinyStories val loss 0.847 on llama2.c's own split; our arms could run it (Llama profile)"
+no,tinyllama-1.1b_hf_gpu,hf,TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T,pretrained,,cuda,speed,,1,128;512;1024,32,10,"research list; 1.1B, download 4.4 GB; published (accuracy, not run by the sweep): HellaSwag 59.20, PIQA 73.29, WinoGrande 59.12; grouped-query attention (4 KV heads) so hf arm only"
+no,qwen2.5-0.5b_hf_gpu,hf,Qwen/Qwen2.5-0.5B,pretrained,,cuda,speed,,1,128;512;1024,32,10,"research list; 0.5B, download 0.99 GB; published (accuracy, not run by the sweep): HellaSwag 51.2, PIQA 69.9; Qwen2 architecture (grouped-query attention, QKV biases) is hf-arm only (untested until downloaded)"

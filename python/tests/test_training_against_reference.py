@@ -45,7 +45,7 @@ def test_gradients_match_autograd_on_the_reference(variant):
         torch.testing.assert_close(grads[name], param.grad, **TIGHT, msg=lambda m, n=name: f"{n}: {m}")
 
 
-@pytest.mark.parametrize("variant", ["gpt2_like", "core_like"])
+@pytest.mark.parametrize("variant", ["gpt2_like", "core_like", "llama_like"])
 def test_three_train_steps_match_torch_adamw(variant):
     cfg, params, model = setup_models(variant)
     ops = host.base_ops(cfg, "train")

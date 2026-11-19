@@ -40,7 +40,9 @@ def test_core_arms_baseline_and_lut():
     assert baseline.timing["repeats"] == 2 and baseline.timing["median_ms"] > 0
     assert baseline.modeled_cost is None and baseline.preset is None
     assert [row["stage"] for row in arm2.modeled_cost] == list(base.STAGES)
-    assert all(row["runs"].startswith("base:") for row in arm2.modeled_cost)
+    runs = {row["stage"]: row["runs"] for row in arm2.modeled_cost}
+    assert {stage for stage, what in runs.items() if what == "not in this model"} == {"rope", "ffn_gate"}
+    assert all(what.startswith("base:") for stage, what in runs.items() if stage not in ("rope", "ffn_gate"))
     with pytest.raises(ValueError, match="hf arm needs"):
         run_arm("hf", weights, ids, repeats=0)
 

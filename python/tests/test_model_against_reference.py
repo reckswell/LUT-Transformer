@@ -37,6 +37,13 @@ VARIANTS = {
                          positional_encoding="none", tie_embeddings=False, bias=False),
     "post_norm": dict(norm="layernorm", norm_placement="post", activation="relu",
                       positional_encoding="sinusoidal", tie_embeddings=False, bias=True),
+    # Llama (stories15M): RMSNorm eps 1e-5, SwiGLU (silu in a gated feed-forward), rotary positions.
+    "llama_like": dict(norm="rmsnorm", norm_eps=1e-5, norm_placement="pre", activation="silu", ffn="glu",
+                       positional_encoding="rope", tie_embeddings=True, bias=False),
+    # The same new pieces in other combinations: GELU-gated (GeGLU) with biases on all three
+    # feed-forward matrices (b3), rotary positions with post-norm, untied output layer.
+    "glu_rope_post_norm": dict(norm="layernorm", norm_placement="post", activation="gelu", ffn="glu",
+                               positional_encoding="rope", rope_theta=500.0, tie_embeddings=False, bias=True),
 }
 TIGHT = dict(rtol=1e-9, atol=1e-9)
 
@@ -95,7 +102,7 @@ def test_prefill_then_decode_matches_full_forward(variant):
     assert cache.length == 16
 
 
-@pytest.mark.parametrize("variant", ["gpt2_like", "core_like"])
+@pytest.mark.parametrize("variant", ["gpt2_like", "core_like", "llama_like"])
 def test_greedy_generate_matches_reference_rollout(variant):
     cfg, params, model = _setup(variant)
     prompt = _tokens(cfg, batch=2, length=5)
@@ -145,8 +152,8 @@ def test_learned_positions_cap_generation_at_context_length():
         host.generate(params, prompt, 4, ops, cfg, temperature=0)
 
 
-def test_sinusoidal_and_no_positions_generate_past_context_length():
-    for variant in ("core_like", "no_positions"):
+def test_sinusoidal_rotary_and_no_positions_generate_past_context_length():
+    for variant in ("core_like", "no_positions", "llama_like"):
         cfg, params, _ = _setup(variant)
         ops = host.base_ops(cfg, "inference")
         out = host.generate(params, _tokens(cfg, 1, cfg.context_length), 4, ops, cfg, temperature=0)

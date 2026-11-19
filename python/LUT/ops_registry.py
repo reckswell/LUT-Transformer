@@ -68,16 +68,22 @@ def resolve_ops(toggles: dict[str, "Stage"], cfg: base.TransformerConfig, mode: 
 
 def describe(toggles: dict[str, "Stage"], cfg: base.TransformerConfig) -> list[dict[str, str]]:
     """One row per stage (stages the toggles leave out run the baseline), for printing and for
-    run metadata: what runs, the table shape and size, the layers, and the input quantization."""
+    run metadata: what runs, the table shape and size, the layers, and the input quantization.
+    A stage the model doesn't have (rope without rotary positions, ffn_gate without a gated
+    feed-forward) says "not in this model"."""
     rows = []
     for stage in base.STAGES:
         choice = toggles.get(stage)
         lut = choice.lut if choice else None
         quant = choice.quant if choice else None
         layers = choice.layers if choice and choice.layers is not None else None
+        if not base.stage_used(stage, cfg):
+            runs = "not in this model"       # e.g. rope without rotary positions; the toggle does nothing
+        else:
+            runs = f"lut:{lut.name}" if lut else f"base:{base.function_name(stage, cfg)}"
         rows.append({
             "stage": stage,
-            "runs": f"lut:{lut.name}" if lut else f"base:{base.function_name(stage, cfg)}",
+            "runs": runs,
             "shape": f"{lut.inputs_per_table} x {lut.bits_per_input} -> {lut.out_bits}" if lut else "-",
             "table_bits": f"{lut.table_bits():,}" if lut else "-",
             "layers": ("-" if stage not in base.LAYER_STAGES

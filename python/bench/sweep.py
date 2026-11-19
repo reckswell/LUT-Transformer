@@ -19,12 +19,13 @@ configs/sweep/models.csv is the example to copy. Required columns: enabled, name
     model            core      the core config (configs/model/core.yaml), GPT-2's 50,257-token vocabulary
                      gpt2      short for openai-community/gpt2
                      stories15m  short for Xenova/llama2.c-stories15M: Karpathy's 15M-parameter Llama
-                               (RoPE, SwiGLU) trained on TinyStories, hf arm only for now
+                               (RoPE, SwiGLU) trained on TinyStories
                      org/name  a Hugging Face repo id, installed in ../LUT-Transformer-local/checkpoints
                      folder    a folder in ../LUT-Transformer-local/checkpoints holding a saved model
                                (config.json, the weights and the tokenizer)
-                     The hf arm runs GPT-2 and Llama models; our baseline and lut arms run GPT-2-
-                     architecture models only, until a Llama profile exists (reference/hf_gpt2.py).
+                     The hf arm runs what transformers runs (HF_ARCHITECTURES); our baseline and
+                     lut arms run the architectures that have a profile (reference/hf_profiles.py:
+                     gpt2 and llama, without grouped-query attention).
     weights          whether the model has been trained before (blank: pretrained for a Hugging Face
                      model, random for the core):
                      pretrained  already trained, by someone else or by us; benchmarked as it is.
@@ -161,10 +162,11 @@ MODEL_ALIASES = {"gpt2": "openai-community/gpt2",
                  # Karpathy's llama2.c stories15M (trained on TinyStories) in Hugging Face's format; its 56
                  # tensors match his original stories15M.pt (karpathy/tinyllamas) bit for bit (2026-11-19)
                  "stories15m": "Xenova/llama2.c-stories15M"}
-# Architectures each arm can run. The hf arm runs whatever transformers runs (tested on these two);
-# our from-scratch arms need a profile per architecture, and only GPT-2's exists (reference/hf_gpt2.py).
-HF_ARCHITECTURES = ("gpt2", "llama")
-OUR_ARCHITECTURES = ("gpt2",)
+# Architectures each arm can run. The hf arm runs whatever transformers runs: tested on gpt2 and
+# llama; opt and qwen2 are listed for the research rows in models.csv and are untested until one is
+# downloaded. Our from-scratch arms need a profile per architecture (reference/hf_profiles.py).
+HF_ARCHITECTURES = ("gpt2", "llama", "opt", "qwen2")
+OUR_ARCHITECTURES = ("gpt2", "llama")
 PHASES = ("prefill", "decode")
 
 CALIBRATION_DECODE_STEPS = 4      # decode steps per context length in a calibration run
@@ -375,7 +377,7 @@ class ModelSource:
     """Where a row's weights come from.
 
     key            the model's name for history and results: "core", a repo id, or a folder name
-    kind           "core" (no published weights) or "pretrained" (loaded through reference/hf_gpt2.py)
+    kind           "core" (no published weights) or "pretrained" (loaded through reference/hf_profiles.py)
     load_name      what from_pretrained gets: the installed snapshot or folder, or a repo id to download
     installed      False only for a repo id that --download will fetch
     max_context    a hard limit from a learned position table (GPT-2's n_positions), or None (the
@@ -544,9 +546,9 @@ def validate(rows: list[Row], settings: Settings) -> tuple[dict[str, ModelSource
             errors.append(f"{where}: the hf arm needs a Hugging Face model; the core has none")
         if row.arm != "hf" and source.kind == "pretrained" and source.installed \
                 and source.architecture not in OUR_ARCHITECTURES:
-            errors.append(f"{where}: {source.key} is a {source.architecture} model (rotary positions, SwiGLU); our "
-                          f"{row.arm} arm runs {', '.join(OUR_ARCHITECTURES)} models only until a "
-                          f"{source.architecture} profile is built. Use arm=hf for now.")
+            errors.append(f"{where}: {source.key} is a {source.architecture} model; our {row.arm} arm runs "
+                          f"{', '.join(OUR_ARCHITECTURES)} models only until a {source.architecture} profile is "
+                          f"built (reference/hf_profiles.py). Use arm=hf for now.")
         if row.arm == "lut" and row.lut_preset != "parameters" and row.lut_preset not in lut_host.PRESETS:
             errors.append(f"{where}: lut_preset {row.lut_preset!r} is not 'params' or one of "
                           f"LUT/host.py PRESETS ({', '.join(lut_host.PRESETS)})")
@@ -602,17 +604,17 @@ def load_model(source: ModelSource, device: str, settings: Settings) -> Loaded:
         cfg = base.TransformerConfig.from_yaml(CORE_CONFIG)
         cfg.vocab_size = CORE_VOCAB
         return Loaded(cfg, base.init_params(cfg, seed=settings.seed, device=device), None)
-    if source.architecture != "gpt2":
+    if source.architecture not in OUR_ARCHITECTURES:
         # hf arm only: transformers' own model class, nothing in our layout
         from transformers import AutoModelForCausalLM
 
         hf_model = AutoModelForCausalLM.from_pretrained(source.load_name, cache_dir=str(settings.checkpoint_dir),
                                                         dtype=base.DTYPE, local_files_only=not settings.download)
         return Loaded(None, {}, hf_model.eval())
-    from reference import hf_gpt2
+    from reference import hf_profiles
 
-    cfg, params, hf_model = hf_gpt2.load_gpt2(source.load_name, device=device, cache_dir=settings.checkpoint_dir,
-                                              local_files_only=not settings.download)
+    cfg, params, hf_model = hf_profiles.load(source.architecture, source.load_name, device=device,
+                                             cache_dir=settings.checkpoint_dir, local_files_only=not settings.download)
     return Loaded(cfg, params, hf_model)
 
 

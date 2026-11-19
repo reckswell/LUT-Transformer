@@ -77,6 +77,65 @@ def learned_positions(length: int, table: Tensor, start: int = 0) -> Tensor:
     return table[start:start + length]
 
 
+def rope_tables(length: int, head_dim: int, theta: float = 10000.0, start: int = 0, *, device=None,
+                dtype=torch.float32) -> tuple[Tensor, Tensor]:
+    """Rotary position tables (cos, sin) for positions start .. start+length-1, each (length, Dh/2).
+
+    Rotary positions (RoPE, used by Llama) don't add anything to the embedding. Instead, inside
+    every attention layer, each query and key is rotated by an angle that grows with its position
+    (the `rope` stage below). Pair i of a head's Dh columns, i = 0 .. Dh/2 - 1, turns at frequency
+        w_i = theta^(-2i / Dh)                    (theta = 10,000 for Llama)
+    so at position p it is rotated by the angle p * w_i, and
+        cos[p, i] = cos(p * w_i),   sin[p, i] = sin(p * w_i).
+    Pair 0 turns once per 2*pi positions; the last pair about once per 2*pi*theta positions.
+
+    The table is a constant (a ROM in hardware). It is built in float32 exactly the way Llama's own
+    code builds it (llama2.c's precompute_freqs_cis, which trained stories15M, and Hugging Face's
+    LlamaRotaryEmbedding, which serves it): w in float32 on the CPU, then angle = p * w and cos, sin
+    in float32. Then it is cast once to `dtype`. So the constants are, bit for bit, the ones the
+    checkpoint was trained and is served with. (A float64-built table would differ by up to about
+    2e-5 at position 255, because p * w is rounded to float32 there; sinusoidal_positions is built
+    in float64 instead because it has no reference implementation to match.)
+    """
+    if head_dim % 2:
+        raise ValueError(f"rotary positions need an even head width, got {head_dim}")
+    # w_i for i = 0 .. Dh/2 - 1: the even column indices 0, 2, 4, ... divided by Dh, as a power of theta.
+    w = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))      # (Dh/2,)
+    p = torch.arange(start, start + length, dtype=torch.float32, device=device)              # (length,)
+    angle = p[:, None] * w.to(device)[None, :]                    # (length, Dh/2), angle[p, i] = p * w_i
+    return torch.cos(angle).to(dtype), torch.sin(angle).to(dtype)
+
+
+def rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """Rotary position embedding: rotate each pair of a head's columns by its position's angle.
+
+    x: (B, H, T, Dh) queries or keys.  cos, sin: (T, Dh/2) from rope_tables for these T positions.
+    Returns (B, H, T, Dh).
+
+    Pairs follow Hugging Face's "split halves" convention: column i pairs with column i + Dh/2.
+    With x1 = x[..., :Dh/2] and x2 = x[..., Dh/2:], each pair (x1_i, x2_i) is a 2-D vector turned
+    by the angle p * w_i:
+        y1 = x1 cos - x2 sin
+        y2 = x2 cos + x1 sin
+    Why this encodes position: a rotation by a then the inverse of b is a rotation by a - b, so after
+    rotating q at position p and k at position s, each pair's contribution to q . k depends only on
+    p - s. Attention scores see relative positions, and nothing is added to the residual stream.
+
+    Convention: llama2.c (and Meta's original Llama code) pairs adjacent columns (2i, 2i+1) instead.
+    The two are the same model once the rows of Wq and Wk are reordered within each head, which is
+    what Hugging Face's conversion script does (reference/hf_llama.permute_rotary_rows). We load the
+    Hugging Face checkpoint, so this function uses split halves; tests/test_llama_profile.py checks
+    that both conventions agree on correspondingly ordered weights and that the wrong pairing fails.
+
+    Cost: 4 multiplies and 2 adds per pair. Per token and layer, q and k each have D/2 pairs, so
+    4D multiplies and 2D adds. cos and sin come from a table indexed by (position, pair).
+    """
+    mid = x.shape[-1] // 2                                     # Dh/2, where the second half starts
+    x1, x2 = x[..., :mid], x[..., mid:]
+    # cos, sin (T, Dh/2) broadcast over the batch and head axes.
+    return torch.cat((x1 * cos - x2 * sin, x2 * cos + x1 * sin), dim=-1)
+
+
 # ----------------------------------------------------------------------------------------------
 # Linear layers and activations
 # ----------------------------------------------------------------------------------------------
@@ -120,6 +179,27 @@ def gelu(x: Tensor) -> Tensor:
     """
     inner = _GELU_C * (x + 0.044715 * x * x * x)              # sqrt(2/pi) * (x + 0.044715 x^3)
     return 0.5 * x * (1.0 + torch.tanh(inner))
+
+
+def silu(x: Tensor) -> Tensor:
+    """SiLU (also called swish), Llama's activation: y = x * sigmoid(x) = x / (1 + exp(-x)), elementwise.
+
+    Like GELU it is a smooth ReLU: about x for large x, about 0 (slightly negative, minimum -0.28 at
+    x = -1.28) for large negative x. For very negative x, exp(-x) overflows to inf and y becomes -0,
+    which is the right limit. Once the input is quantized to b bits it is a 2^b-entry table.
+    """
+    return x / (1.0 + torch.exp(-x))
+
+
+def glu_gate(a: Tensor, b: Tensor) -> Tensor:
+    """The gate of a gated feed-forward (GLU): y = a * b, elementwise.
+
+    a = act(h W1^T) and b = h W3^T, both (..., F). With act = SiLU this is Llama's SwiGLU:
+        FFN(h) = W2 (silu(W1 h) * (W3 h)).
+    One multiply per element (F per token per layer). Unlike the linear layers, both operands are
+    produced at run time, as in QK^T and PV, so no weight can be folded into a table for it.
+    """
+    return a * b
 
 
 # ----------------------------------------------------------------------------------------------

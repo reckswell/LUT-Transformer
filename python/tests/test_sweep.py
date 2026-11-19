@@ -124,7 +124,7 @@ def test_resolve_model_reads_only_the_checkpoint_folder(tmp_path):
     assert llama.architecture == "llama" and llama.max_context is None and llama.eval_context == 64
     assert llama.load_name.endswith("snapshots/abc123")         # the installed folder: loads offline
     _fake_checkpoints(root, "org/bert-ish", model_type="bert")
-    with pytest.raises(sweep.SweepError, match="the sweep runs gpt2, llama models"):
+    with pytest.raises(sweep.SweepError, match="the sweep runs gpt2, llama, opt, qwen2 models"):
         sweep.resolve_model("org/bert-ish", root)
 
 
@@ -582,7 +582,7 @@ def test_datasets_and_models_share_the_local_folder():
 
 
 # ----------------------------------------------------------------------------------------------
-# stories15M: a Llama model the hf arm runs; our arms wait for a Llama profile
+# stories15M: a Llama model every arm runs (our arms through the Llama profile, reference/hf_llama.py)
 # ----------------------------------------------------------------------------------------------
 
 def _stories15m_or_skip() -> sweep.ModelSource:
@@ -594,23 +594,28 @@ def _stories15m_or_skip() -> sweep.ModelSource:
     return source
 
 
-def test_our_arms_refuse_a_llama_model_with_the_reason(tmp_path, monkeypatch):
+def test_every_arm_takes_a_llama_model_and_ours_refuse_one_without_a_profile(tmp_path, monkeypatch):
     root = tmp_path / "ckpt"
     _fake_checkpoints(root, "org/llama-ish", model_type="llama")
+    _fake_checkpoints(root, "org/opt-ish", model_type="opt")
     monkeypatch.setattr(local_cache, "CHECKPOINT_DIR", root)
     rows, _ = sweep.read_csv(_full_csv(tmp_path, "yes,ours,baseline,org/llama-ish,,,cpu,speed,,1,8,2,1,\n"
                                                  "yes,lut,lut,org/llama-ish,,params,cpu,speed,,1,8,2,1,\n"
-                                                 "yes,theirs,hf,org/llama-ish,,,cpu,speed,,1,8,2,1,\n"))
+                                                 "yes,theirs,hf,org/llama-ish,,,cpu,speed,,1,8,2,1,\n"
+                                                 "yes,opt_ours,baseline,org/opt-ish,,,cpu,speed,,1,8,2,1,\n"
+                                                 "yes,opt_lut,lut,org/opt-ish,,params,cpu,speed,,1,8,2,1,\n"
+                                                 "yes,opt_theirs,hf,org/opt-ish,,,cpu,speed,,1,8,2,1,\n"))
     _, errors = sweep.validate(rows, sweep.Settings(csv_path=tmp_path / "full.csv"))
-    assert len(errors) == 2 and all("is a llama model" in e and "Use arm=hf for now" in e for e in errors)
+    assert len(errors) == 2 and all("opt_" in e and "is a opt model" in e and "Use arm=hf for now" in e for e in errors)
 
 
 def test_stories15m_hf_runner_matches_generate_and_rewinds():
     source = _stories15m_or_skip()
     assert source.architecture == "llama" and source.vocab_size == 32000 and source.eval_context == 256
     loaded = sweep.load_model(source, "cpu", sweep.Settings())
-    assert loaded.cfg is None and loaded.vocab_size == 32000
+    assert loaded.cfg.name == "stories15m" and loaded.vocab_size == 32000
     assert sum(p.numel() for p in loaded.hf_model.parameters()) == 15_191_712
+    assert sweep.base.count_params(loaded.cfg)["total"] == 15_191_712
     ids = sweep.make_prompt(loaded.vocab_size, 1, 16, 0, "cpu")
     runner = sweep.make_runner(sweep.Row(1, True, "s", "hf", "stories15m", None, "cpu", 1, [16], 4, 1), loaded)
     runner.start(1, 20)
@@ -634,4 +639,39 @@ def test_stories15m_speed_row_through_the_sweep(tmp_path):
         lines = list(csv.DictReader(handle))
     assert [(l["model"], l["weights"], l["context"]) for l in lines] == \
         [("Xenova/llama2.c-stories15M", "pretrained", "8"), ("Xenova/llama2.c-stories15M", "pretrained", "16")]
+    assert all(float(l["decode_ms_per_token_median"]) > 0 for l in lines)
+
+
+def test_stories15m_our_runners_decode_the_same_tokens_as_the_hf_runner():
+    # Greedy prefill + decode through the sweep's own runners: hf, baseline and lut (all_base) agree
+    # on every token, and the two from-scratch arms agree bit for bit on the logits path (same tokens
+    # here; tests/test_llama_profile.py checks the logits).
+    source = _stories15m_or_skip()
+    loaded = sweep.load_model(source, "cpu", sweep.Settings())
+    ids = sweep.make_prompt(loaded.vocab_size, 1, 16, 0, "cpu")
+    tokens = {}
+    for arm, preset in (("hf", None), ("baseline", None), ("lut", "all_base")):
+        runner = sweep.make_runner(sweep.Row(1, True, arm, arm, "stories15m", preset, "cpu", 1, [16], 6, 1), loaded)
+        runner.start(1, 24)
+        out = [runner.prefill(ids)]
+        for _ in range(6):
+            out.append(runner.decode(out[-1]))
+        runner.rewind(16)
+        assert int(runner.decode(out[0])) == int(out[1])        # the cache rewinds like the hf arm's
+        tokens[arm] = [int(t) for t in out]
+    assert tokens["baseline"] == tokens["hf"] == tokens["lut"]
+
+
+def test_stories15m_baseline_and_lut_speed_rows_through_the_sweep(tmp_path):
+    _stories15m_or_skip()
+    path = _full_csv(tmp_path, "yes,s15_base,baseline,stories15m,,,cpu,speed,,1,8;16,2,1,\n"
+                               "yes,s15_lut,lut,stories15m,,all_base,cpu,speed,,1,8,2,1,\n")
+    assert sweep.main(["--csv", str(path), "--results-dir", str(tmp_path / "r"), "--history", str(tmp_path / "h.jsonl"),
+                       "--no-power", "--no-progress", "--warmup", "1"]) == 0
+    (sweep_dir,) = (tmp_path / "r" / "sweeps").iterdir()
+    with open(sweep_dir / "summary.csv", newline="") as handle:
+        lines = list(csv.DictReader(handle))
+    assert [(l["arm"], l["model"], l["context"]) for l in lines] == \
+        [("baseline", "Xenova/llama2.c-stories15M", "8"), ("baseline", "Xenova/llama2.c-stories15M", "16"),
+         ("lut", "Xenova/llama2.c-stories15M", "8")]
     assert all(float(l["decode_ms_per_token_median"]) > 0 for l in lines)
