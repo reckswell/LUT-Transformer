@@ -377,25 +377,30 @@ def training_loop(
     eval_every: int | None = None,
     device: str = "cpu",
     desc: str = "train",
+    progress: bool | None = None,
 ) -> dict[str, Any]:
-    """Run num_steps training steps with a tqdm progress bar (rate and time remaining) and log them.
+    """Run num_steps training steps with a tqdm progress bar (rate, elapsed and time remaining) and
+    log them.
 
     step_fn(step, batch) does one forward, backward and optimizer update and returns a dict with
     at least "loss" and optionally "tokens" (tokens in the batch) and anything else to log.
     eval_fn(step) returns validation metrics; it runs every eval_every steps.
     run is a bench.runlog.Run (or None to skip logging). Returns a summary including the total
     wall-clock training time.
-    """
-    from tqdm import tqdm
 
+    progress: the bar (bench/progress.py, the same style as the benchmark sweep and the eval
+    harness). None shows it in a terminal and hides it in pytest and logs; True or False forces it.
+    The bar is updated after each step's stop timestamp, so it is not in step_time_s.
+    """
+    from bench.progress import progress_bar
     from bench.timing import Stopwatch
 
     batch_iter = iter(batches)
     tokens_seen = 0
     last_loss = float("nan")
     with Stopwatch(device) as total:
-        progress = tqdm(range(num_steps), desc=desc, unit="step", dynamic_ncols=True)
-        for step in progress:
+        progress_iter = progress_bar(range(num_steps), desc=desc, unit="step", show=progress)
+        for step in progress_iter:
             batch = next(batch_iter)
             start = time.perf_counter()
             metrics = {key: (float(value) if isinstance(value, (int, float, Tensor)) else value)
@@ -403,14 +408,17 @@ def training_loop(
             step_time = time.perf_counter() - start
             last_loss = metrics["loss"]
             tokens_seen += int(metrics.get("tokens", 0))
-            progress.set_postfix(loss=f"{last_loss:.4f}")
+            postfix = {"loss": f"{last_loss:.4f}"}
+            if metrics.get("tokens") and step_time > 0:
+                postfix["tok/s"] = f"{metrics['tokens'] / step_time:,.0f}"
+            progress_iter.set_postfix(postfix, refresh=False)
             if run is not None and (step % log_every == 0 or step == num_steps - 1):
                 run.log(kind="train", step=step, step_time_s=step_time, **metrics)
             if eval_fn is not None and eval_every and (step + 1) % eval_every == 0:
                 eval_metrics = eval_fn(step)
                 if run is not None:
                     run.log(kind="eval", step=step, **eval_metrics)
-                progress.write(f"step {step + 1}: " + ", ".join(f"{k}={v:.4g}" for k, v in eval_metrics.items()))
+                progress_iter.write(f"step {step + 1}: " + ", ".join(f"{k}={v:.4g}" for k, v in eval_metrics.items()))
     return {
         "train_time_s": total.elapsed_s,
         "steps": num_steps,

@@ -39,6 +39,7 @@ import torch
 from torch import Tensor
 
 from baseline import host as base
+from bench.progress import progress_bar
 from bench.timing import time_fn
 from common import precision
 from LUT import host as lut_host
@@ -136,12 +137,16 @@ def _forward_fn(arm: str, weights: Weights, token_ids: Tensor, preset: str):
 
 
 def run_arm(arm: str, weights: Weights, token_ids: Tensor, *, preset: str = "parameters",
-            repeats: int = 5, warmup: int = 2) -> ArmResult:
+            repeats: int = 5, warmup: int = 2, progress: bool | None = None) -> ArmResult:
     """Run one arm on token_ids (B, T), which must be on the same device as the weights.
 
     preset applies to the lut arm only: "parameters" reads LUT/host.py's PARAMETERS block at this
     moment (so an override like lut_host.SOFTMAX = Stage(...) is picked up); other names are
     LUT/host.py PRESETS. repeats = 0 skips the timing.
+
+    progress: a tqdm bar with the time remaining over the warm-up and timed calls (bench/progress.py).
+    None shows it in a terminal and hides it in pytest and logs; True or False forces it. The bar is
+    updated between calls, never inside a timed one.
 
     token_ids are integer indices (int64) into the token table, not values; float token ids are
     refused. TF32 is turned off first (common/precision.full_fp32), so float32 means full float32.
@@ -154,7 +159,12 @@ def run_arm(arm: str, weights: Weights, token_ids: Tensor, *, preset: str = "par
     logits = run()
     loss = next_token_loss(logits, token_ids)
     device = str(token_ids.device)
-    timing = time_fn(run, device=device, warmup=warmup, repeats=repeats).to_dict() if repeats else None
+    timing = None
+    if repeats:
+        label = f"{arm}" + (f" {preset}" if arm == "lut" else "") + f" forward B={token_ids.shape[0]} T={token_ids.shape[1]}"
+        with progress_bar(total=warmup + repeats, desc=label, unit="call", show=progress, leave=False) as bar:
+            timing = time_fn(run, device=device, warmup=warmup, repeats=repeats,
+                             after_call=lambda: bar.update(1)).to_dict()
     cost = ops_registry.describe(lut_host.preset_toggles(preset), weights.cfg) if arm == "lut" else None
     return ArmResult(arm=arm, preset=preset if arm == "lut" else None, device=device, dtype=str(dtype),
                      precision=fp, logits=logits,

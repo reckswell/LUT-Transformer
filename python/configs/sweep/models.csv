@@ -1,0 +1,30 @@
+# Benchmark sweep: one row per model and setting, with the benchmarks and datasets to run on it. From python/:
+#   python -m bench.sweep --dry-run      the plan and its time estimate; no benchmark runs
+#   python -m bench.sweep                every row with enabled=yes
+#   python -m bench.sweep --only NAME    one row (or several, comma-separated), even if enabled=no
+# Columns are explained at the top of python/bench/sweep.py. In short:
+#   weights     pretrained = already trained (by others, or by us): benchmarked as it is, never retrained
+#               random     = never trained; speed only (timing doesn't depend on the weights)
+#               train      = nobody has trained it yet; listed in the plan as "needs training", not run
+#   benchmarks  speed (latency, tokens/s, power on synthetic tokens) and/or perplexity (on each dataset)
+#   datasets    wikitext2, tinystories (common/data.py); used by perplexity, ignored by speed
+#   batch, context_lengths, decode_tokens, repeats: speed only
+# Models load only from ../LUT-Transformer-local/checkpoints. Installed: gpt2 (openai-community/gpt2, 124M) and
+# stories15m (Xenova/llama2.c-stories15M: Karpathy's 15.2M-parameter Llama trained on TinyStories; hf arm only
+# until our from-scratch arms get a Llama profile).
+# datasets only from ../LUT-Transformer-local/datasets (none downloaded yet, so the perplexity rows are off).
+# The GPU rows start off too: set enabled to yes when the GPU is free.
+enabled,name,arm,model,weights,lut_preset,device,benchmarks,datasets,batch,context_lengths,decode_tokens,repeats,notes
+yes,core_base_cpu,baseline,core,random,,cpu,speed,,1,128;512,32,5,core config with random weights
+yes,core_lut_allbase_cpu,lut,core,random,all_base,cpu,speed,,1,128;512,32,5,LUT wiring with every stage on BASE (control: should match core_base_cpu)
+yes,gpt2_hf_cpu,hf,gpt2,pretrained,,cpu,speed,,1,128;512,32,5,Hugging Face GPT-2 as transformers ships it
+yes,gpt2_base_cpu,baseline,gpt2,pretrained,,cpu,speed,,1,128;512,32,5,our from-scratch model on GPT-2's weights
+no,core_trained_tinystories,baseline,core,train,,cpu,perplexity,tinystories,,,,,Track A (the core trained on TinyStories): not needed while stories15m (already trained on TinyStories) is the small baseline
+yes,stories15m_hf_cpu,hf,stories15m,pretrained,,cpu,speed,,1,64;224,32,5,small pretrained baseline (Alpha 2026-11-19); trained with 256-token context
+no,stories15m_hf_ppl_cpu,hf,stories15m,pretrained,,cpu,perplexity,tinystories,,,,,needs the TinyStories dataset (--download)
+no,gpt2_hf_ppl_gpu,hf,gpt2,pretrained,,cuda,perplexity,wikitext2;tinystories,,,,,needs the datasets (--download) and pyarrow for wikitext2
+no,gpt2_base_ppl_gpu,baseline,gpt2,pretrained,,cuda,perplexity,wikitext2;tinystories,,,,,should match gpt2_hf_ppl_gpu
+no,gpt2_hf_gpu,hf,gpt2,pretrained,,cuda,speed,,1,128;512;992,32,10,
+no,gpt2_base_gpu,baseline,gpt2,pretrained,,cuda,speed,,1,128;512;992,32,10,
+no,stories15m_hf_gpu,hf,stories15m,pretrained,,cuda,speed,,1,64;224,32,10,
+no,core_base_gpu_long,baseline,core,random,,cuda,speed,,1,1024;4096;16384,32,5,decode time per token against context length

@@ -7,8 +7,8 @@ power telemetry and run logging work on this machine before the model is built.
     python -m bench.run_benchmark --workload matmul --device cuda --size 4096 --power
     python -m bench.run_benchmark --workload matmul --device cpu --size 1024 --power
 
-The `model` workload (prefill and decode of the from-scratch transformer for a given variant
-and hardware config) is added in window 1, once baseline/host.py and LUT/host.py can run inference.
+Prefill and decode of the models themselves (Hugging Face, baseline and LUT arms, one or many at
+once) are benchmarked by bench/sweep.py, from the list in configs/sweep/models.csv.
 """
 
 from __future__ import annotations

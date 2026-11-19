@@ -84,16 +84,24 @@ def time_fn(
     device: str = "cpu",
     warmup: int = 3,
     repeats: int = 10,
+    after_call: Callable[[], Any] | None = None,
 ) -> TimingStats:
     """Time fn() on `device` ("cpu" or "cuda[:n]").
 
     Runs fn() `warmup` times untimed (fills caches, triggers lazy CUDA init and kernel
     selection), then `repeats` timed calls with a device synchronize around each one.
+
+    after_call(), if given, runs after every warm-up and timed call, after that call's stop
+    timestamp and before the next call's start, so whatever it does (a progress bar update,
+    bench/progress.py) is never inside a timed region.
     """
     if repeats < 1:
         raise ValueError("repeats must be at least 1")
     for _ in range(warmup):
         fn()
+        if after_call is not None:
+            _synchronize(device)
+            after_call()
     _synchronize(device)
 
     samples_ms: list[float] = []
@@ -103,6 +111,8 @@ def time_fn(
         fn()
         _synchronize(device)
         samples_ms.append((time.perf_counter() - start) * 1000.0)
+        if after_call is not None:
+            after_call()
     return summarize(samples_ms, warmup, device)
 
 

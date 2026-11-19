@@ -15,10 +15,10 @@ Status: the from-scratch baseline (inference, KV-cache decode and hand-written t
 | `python/reference/` | Library-built controls, never part of our model: `torch_model.py` (the core built from `torch.nn`) and `hf_gpt2.py` (Hugging Face GPT-2, imported unmodified, and its weights mapped into our layout) |
 | `python/eval/` | Runs any arm (Hugging Face, baseline, LUT) on the same tokens and weights: logits, perplexity, timing and the LUT table cost |
 | `python/common/` | Fixed-point and integer quantization (`quant.py`), datasets (`data.py`) |
-| `python/configs/` | Model shapes (`model/`) and device per task (`hw/`) |
-| `python/bench/` | Timing, power telemetry (CPU RAPL, NVIDIA, XRT) and run logging |
+| `python/configs/` | Model shapes (`model/`), device per task (`hw/`), and the models to benchmark at once (`sweep/models.csv`) |
+| `python/bench/` | Timing, power telemetry (CPU RAPL, NVIDIA, XRT), run logging, progress bars with time estimates, and the benchmark sweep (`sweep.py`) |
 | `python/tests/` | Each from-scratch function against PyTorch, the model against the references, the LUT wiring against the baseline, and the folder rules |
-| `results/` | One directory per run plus `summary.csv` |
+| `results/` | One directory per run plus `summary.csv`; one directory per sweep under `sweeps/` |
 
 ## Quick start
 
@@ -31,6 +31,10 @@ cd python
 python -m baseline.host info
 python -m LUT.host info
 python -m bench.run_benchmark --workload matmul --device cuda --size 4096 --power
+python -m bench.sweep --dry-run          # plan and time estimate for configs/sweep/models.csv
+python -m bench.sweep                    # run it: progress bars with time remaining, results under results/
 ```
 
-Downloaded models (GPT-2 small, about 550 MB) and Hugging Face's cache go to `../LUT-Transformer-local/` beside the repository, never into the repository or `~/.cache` (`python/reference/local_cache.py`; `LUT_LOCAL_DIR`, `LUT_CHECKPOINT_DIR` or `HF_HOME` override it). The real-weights GPT-2 test downloads them once with `LUT_GPT2_DOWNLOAD=1 pytest python/tests/test_gpt2_profile.py`.
+The sweep runs every enabled row of `python/configs/sweep/models.csv`. Each row names an arm, a model, whether the model has been trained before (`weights`: pretrained, random or train), the benchmarks (`speed`: prefill and decode latency, tokens per second, power and energy; `perplexity` on each listed dataset) and the datasets (`wikitext2`, `tinystories`). The sweep never trains: models others have trained are benchmarked as they are, and rows that would need training are listed in the plan, not run. Models and datasets load only from `../LUT-Transformer-local` (`checkpoints/`, `datasets/`); a row naming one that isn't there stops the sweep before anything runs, and nothing is downloaded without `--download`. Columns and options are documented at the top of `python/bench/sweep.py`.
+
+Downloaded models (GPT-2 small, about 550 MB; stories15M, Karpathy's 15M-parameter Llama trained on TinyStories, 61 MB) and Hugging Face's cache go to `../LUT-Transformer-local/` beside the repository, never into the repository or `~/.cache` (`python/reference/local_cache.py`; `LUT_LOCAL_DIR`, `LUT_CHECKPOINT_DIR` or `HF_HOME` override it). The real-weights GPT-2 test downloads them once with `LUT_GPT2_DOWNLOAD=1 pytest python/tests/test_gpt2_profile.py`.

@@ -118,8 +118,13 @@ def gpt2_params_from_hf(state_dict: dict[str, Tensor], cfg: host.TransformerConf
 
 def load_gpt2(model_name: str = "openai-community/gpt2", *, device: str = "cpu",
               dtype: torch.dtype = host.DTYPE,
-              cache_dir: str | Path = CHECKPOINT_DIR) -> tuple[host.TransformerConfig, dict[str, Tensor], Any]:
+              cache_dir: str | Path = CHECKPOINT_DIR,
+              local_files_only: bool = False) -> tuple[host.TransformerConfig, dict[str, Tensor], Any]:
     """Load a pretrained GPT-2 from Hugging Face (downloaded once into CHECKPOINT_DIR).
+
+    model_name is a Hugging Face repo id, or a folder that holds a saved model (config.json and the
+    weights). local_files_only=True never touches the network: a model that isn't already in
+    cache_dir raises instead of downloading (the benchmark sweep uses this unless --download).
 
     Returns (cfg, params, hf_model): our config, our parameter dict on `device`, and the
     Hugging Face GPT2LMHeadModel itself (in eval mode, on the CPU) as the ground truth. Both are
@@ -130,7 +135,8 @@ def load_gpt2(model_name: str = "openai-community/gpt2", *, device: str = "cpu",
     use_local_hf_cache()                 # raises if huggingface_hub's cache points anywhere else
     from transformers import GPT2LMHeadModel
 
-    hf_model = GPT2LMHeadModel.from_pretrained(model_name, cache_dir=str(cache_dir), dtype=dtype).eval()
+    hf_model = GPT2LMHeadModel.from_pretrained(model_name, cache_dir=str(cache_dir), dtype=dtype,
+                                               local_files_only=local_files_only).eval()
     if next(hf_model.parameters()).dtype != dtype:
         hf_model = hf_model.to(dtype)
     cfg = gpt2_config_from_hf(hf_model.config)

@@ -16,7 +16,7 @@ checkpoints/
 *.ckpt
 
 # Raw power samples can be large; summaries and metrics are committed.
-results/runs/*/power_samples.json
+results/runs/*/power_samples*.json
 
 # Python
 __pycache__/
