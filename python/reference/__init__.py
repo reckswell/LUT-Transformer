@@ -1,0 +1,12 @@
+"""Library-built models used as controls. Nothing here is part of our model.
+
+Files:
+    torch_model.py  the core transformer built from torch.nn and autograd: the ground truth for
+                    the from-scratch baseline (same weights in, same logits and gradients out)
+    hf_gpt2.py      Hugging Face GPT-2, imported from `transformers` and never modified, plus the
+                    export of its weights into our parameter layout (host.init_params names)
+
+baseline/ and LUT/ never import from here; tests/ and eval/ do. Keeping the library code out of
+those folders keeps them purely from scratch (agent.md 2.1) and keeps each control independent of
+the code it checks.
+"""

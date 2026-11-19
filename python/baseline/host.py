@@ -4,7 +4,8 @@ This is the file to read to see how the model is put together, the way a torch.n
 forward() reads. It owns the configuration, the parameters, the list of stages, and the order in
 which the stage functions are called. The math of each stage lives in train.py and inference.py,
 written from base operations. There are no LUTs here: the LUT model is python/LUT/host.py, which
-calls the same composition below with some stages switched to LUT functions.
+has its own copy of this composition (so it can be restructured later) and calls the functions
+its per-stage toggles pick.
 
 Which device runs which task (train, prefill, decode) comes from a hardware config.
 
@@ -16,7 +17,7 @@ Which device runs which task (train, prefill, decode) comes from a hardware conf
     python -m baseline.host generate ... --prompt "Once upon a time"
 
 Status: inference (forward, prefill, decode_step, generate) and training (forward_train, backward,
-train_step) work and are checked against reference_torch.py and autograd. The train / evaluate /
+train_step) work and are checked against reference/torch_model.py and autograd. The train / evaluate /
 generate commands come next; they need a tokenizer and dataset (D2).
 """
 
@@ -199,7 +200,7 @@ def _get(module: Any, name: str) -> Callable[..., Any]:
 
 def param_shapes(cfg: TransformerConfig) -> dict[str, tuple[int, ...]]:
     """Every parameter's name and shape, in a fixed order, named like the reference model so
-    weights can be copied in both directions (reference_torch.copy_params_*):
+    weights can be copied in both directions (reference/torch_model.copy_params_*):
 
         tok_emb                      (V, D)
         pos_emb                      (context_length, D)   only if positional_encoding = learned
@@ -311,7 +312,9 @@ def count_params(cfg: TransformerConfig) -> dict[str, int]:
 # ops.lm_head -> logits. Training runs this with the *_forward functions, keeps every cache, and
 # then calls the *_backward functions in exactly the reverse order. Inference splits it into
 # prefill (the whole prompt at once, filling the KV cache) and decode (one token at a time,
-# reading the cache). Every function below takes `ops`, so the LUT host runs this same code.
+# reading the cache). Every function below takes `ops`, the function each stage calls.
+# LUT/host.py has its own copy of this composition; tests/test_lut_wiring.py checks that, with
+# every stage on BASE, the copy gives bit-identical results.
 #
 # split_heads, merge_heads, causal_mask and the position codes are not stages: they re-index
 # tensors or build constants and do no arithmetic on activations, so they never get a LUT and are
@@ -403,7 +406,7 @@ def _head(params: dict, x: Tensor, ops: ModelOps, cfg: TransformerConfig) -> Ten
 
 def forward(params: dict, token_ids: Tensor, ops: ModelOps, cfg: TransformerConfig) -> Tensor:
     """The whole sequence at once with no cache: token_ids (B, T) -> logits (B, T, V) for every
-    position. Used for evaluation (perplexity) and to check against reference_torch."""
+    position. Used for evaluation (perplexity) and to check against reference/torch_model.py."""
     return _head(params, _residual_stream(params, token_ids, ops, cfg, None), ops, cfg)
 
 

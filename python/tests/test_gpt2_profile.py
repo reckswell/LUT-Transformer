@@ -20,7 +20,7 @@ torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
 from baseline import host  # noqa: E402
-from common import checkpoints  # noqa: E402
+from reference import hf_gpt2  # noqa: E402
 from LUT import host as lut_host  # noqa: E402
 
 TIGHT = dict(rtol=1e-9, atol=1e-9)
@@ -43,14 +43,14 @@ def _small_hf_gpt2(seed: int = 0):
 def test_gpt2_yaml_profile_matches_hugging_face_gpt2_small():
     # GPT2Config() defaults are GPT-2 small, so this checks configs/model/gpt2.yaml without a download.
     from_yaml = host.TransformerConfig.from_yaml(host.PYTHON_DIR / "configs/model/gpt2.yaml")
-    assert asdict(from_yaml) == asdict(checkpoints.gpt2_config_from_hf(transformers.GPT2Config()))
+    assert asdict(from_yaml) == asdict(hf_gpt2.gpt2_config_from_hf(transformers.GPT2Config()))
     assert host.count_params(from_yaml)["total"] == 124_439_808     # GPT-2 small, tied embedding counted once
 
 
 def test_gpt2_weights_run_in_our_code_and_match_hugging_face():
     model = _small_hf_gpt2()
-    cfg = checkpoints.gpt2_config_from_hf(model.config)
-    params = checkpoints.gpt2_params_from_hf(model.state_dict(), cfg)
+    cfg = hf_gpt2.gpt2_config_from_hf(model.config)
+    params = hf_gpt2.gpt2_params_from_hf(model.state_dict(), cfg)
     ids = torch.randint(0, 37, (3, 24), generator=torch.Generator().manual_seed(1))
     ours = host.forward(params, ids, host.base_ops(cfg, "inference"), cfg)
     with torch.no_grad():
@@ -60,8 +60,8 @@ def test_gpt2_weights_run_in_our_code_and_match_hugging_face():
 
 def test_gpt2_through_the_lut_host_and_kv_cache():
     model = _small_hf_gpt2(seed=3)
-    cfg = checkpoints.gpt2_config_from_hf(model.config)
-    params = checkpoints.gpt2_params_from_hf(model.state_dict(), cfg)
+    cfg = hf_gpt2.gpt2_config_from_hf(model.config)
+    params = hf_gpt2.gpt2_params_from_hf(model.state_dict(), cfg)
     ids = torch.randint(0, 37, (2, 16), generator=torch.Generator().manual_seed(2))
     with torch.no_grad():
         theirs = model(ids).logits
@@ -74,19 +74,19 @@ def test_gpt2_through_the_lut_host_and_kv_cache():
 
 def test_loader_rejects_settings_we_do_not_model():
     with pytest.raises(ValueError, match="tanh GELU"):
-        checkpoints.gpt2_config_from_hf(transformers.GPT2Config(activation_function="relu"))
+        hf_gpt2.gpt2_config_from_hf(transformers.GPT2Config(activation_function="relu"))
     with pytest.raises(ValueError, match="layer_norm_epsilon"):
-        checkpoints.gpt2_config_from_hf(transformers.GPT2Config(layer_norm_epsilon=1e-6))
+        hf_gpt2.gpt2_config_from_hf(transformers.GPT2Config(layer_norm_epsilon=1e-6))
 
 
 def _pretrained_available() -> bool:
-    return os.environ.get("LUT_GPT2_DOWNLOAD") == "1" or any(checkpoints.CHECKPOINT_DIR.glob("models--openai-community--gpt2*"))
+    return os.environ.get("LUT_GPT2_DOWNLOAD") == "1" or any(hf_gpt2.CHECKPOINT_DIR.glob("models--openai-community--gpt2*"))
 
 
 @pytest.mark.skipif(not _pretrained_available(), reason="GPT-2 weights not in checkpoints/ (set LUT_GPT2_DOWNLOAD=1 to fetch, about 550 MB)")
 def test_pretrained_gpt2_small_matches_hugging_face():
-    cfg, params, hf_model = checkpoints.load_gpt2()
-    tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2", cache_dir=str(checkpoints.CHECKPOINT_DIR))
+    cfg, params, hf_model = hf_gpt2.load_gpt2()
+    tokenizer = transformers.AutoTokenizer.from_pretrained("openai-community/gpt2", cache_dir=str(hf_gpt2.CHECKPOINT_DIR))
     ids = tokenizer("The quick brown fox jumps over the lazy dog because", return_tensors="pt").input_ids
     ours = host.forward(params, ids, host.base_ops(cfg, "inference"), cfg)
     with torch.no_grad():

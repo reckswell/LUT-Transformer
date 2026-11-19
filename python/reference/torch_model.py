@@ -1,5 +1,8 @@
 """Ground-truth transformer built from standard PyTorch modules (torch.nn, autograd).
 
+A control, not part of our model: it lives in reference/ with the other library-built models, so
+baseline/ and LUT/ hold only from-scratch code. (Formerly baseline/reference_torch.py.)
+
 Two jobs:
   1. Correctness: given the same weights and inputs, the from-scratch model in baseline/host.py must
      produce the same logits, loss and gradients as this one (python/tests/test_model_against_reference.py).

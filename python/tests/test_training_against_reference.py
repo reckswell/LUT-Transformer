@@ -12,7 +12,7 @@ torch = pytest.importorskip("torch")
 F = torch.nn.functional
 
 from baseline import host  # noqa: E402
-from baseline import reference_torch as ref  # noqa: E402
+from reference import torch_model as ref  # noqa: E402
 from test_model_against_reference import VARIANTS  # noqa: E402
 from test_model_against_reference import _setup as setup_models  # noqa: E402
 from test_model_against_reference import _tokens as tokens  # noqa: E402

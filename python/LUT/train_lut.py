@@ -1,5 +1,5 @@
 """Training functions, LUT versions. Same signatures as baseline/train.py (<op>_forward / <op>_backward),
-plus the architecture (`arch=`, a LUT/host.py LUTArch) on each forward.
+plus the architecture (`arch=`, a LUT/stages.py LUTArch) on each forward.
 
 Open question for Alpha (window 2), set by TRAIN_WITH_LUTS in LUT/host.py:
 does training ever see the LUTs?
@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from LUT.host import LUTArch
+    from LUT.stages import LUTArch
 
 Cache = dict[str, Any]
 

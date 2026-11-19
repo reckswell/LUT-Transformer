@@ -2,7 +2,7 @@
 architecture to use and its tables.
 
 The toggles in LUT/host.py decide which stages run these instead of the baseline functions, and
-with which architecture; LUT/ops_registry.py binds that choice as `arch=` (a LUT/host.py LUTArch).
+with which architecture; LUT/ops_registry.py binds that choice as `arch=` (a LUT/stages.py LUTArch).
 Each function also takes the `tables` built ahead of time by build_tables(), because in hardware
 the tables are filled before inference starts.
 
@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from LUT.host import LUTArch
+    from LUT.stages import LUTArch
 
 # LUT architectures the toggles may name: name -> one-line description of what it computes and
 # which stages it covers. Empty until the LUT design (decision D5) is implemented.

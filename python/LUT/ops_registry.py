@@ -1,6 +1,8 @@
-"""Turn the LUT host's toggles into the functions the model calls.
+"""Turn the LUT host's toggles (its PARAMETERS block, or a named preset) into the functions its
+wiring calls.
 
-Start from every stage on its baseline function (baseline/host.py:base_ops), then, for each stage
+Start from every stage on its baseline function (baseline/host.py:base_ops, the same building
+blocks the baseline model uses), then, for each stage
 the toggles give a LUT architecture, swap in the same-named function from inference_lut.py (or the
 <name>_forward / <name>_backward pair from train_lut.py in training), with the architecture bound
 to it, in the layers the toggle names. Everything is checked here, at start-up, so a typo in the
@@ -16,7 +18,7 @@ from baseline import host as base
 from LUT import inference_lut, train_lut
 
 if TYPE_CHECKING:
-    from LUT.host import Stage
+    from LUT.stages import Stage
 
 
 def check_toggles(toggles: dict[str, "Stage"], cfg: base.TransformerConfig) -> None:
@@ -46,7 +48,8 @@ def lut_function(stage: str, choice: "Stage", cfg: base.TransformerConfig, mode:
 
 
 def resolve_ops(toggles: dict[str, "Stage"], cfg: base.TransformerConfig, mode: base.Mode) -> base.ModelOps:
-    """ModelOps for baseline/host.py's composition, with each toggled stage swapped in."""
+    """ModelOps for LUT/host.py's wiring: every stage on its baseline function, then each toggled
+    stage swapped in. Stages are independent; nothing here overrides a toggle."""
     check_toggles(toggles, cfg)
     ops = base.base_ops(cfg, mode)
     for stage, choice in toggles.items():

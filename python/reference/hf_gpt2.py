@@ -1,9 +1,14 @@
-"""Pretrained weights for model profiles, loaded into the host.init_params layout.
+"""Hugging Face GPT-2, imported and never modified, plus the export of its weights into our layout.
 
-A profile is a config (python/configs/model/<name>.yaml) plus a loader here that maps the
-published checkpoint's names and layouts onto ours, so the from-scratch code (and the LUT host's
-toggles) run the real weights. The published model itself, imported from Hugging Face
-`transformers`, is the profile's ground truth; we don't reimplement it.
+A control, not part of our model: it lives in reference/ with the other library-built models, so
+baseline/ and LUT/ hold only from-scratch code. (Formerly common/checkpoints.py.)
+
+A model profile is a config (python/configs/model/<name>.yaml) plus a loader that maps the
+published checkpoint's names and layouts onto ours (host.init_params), so the from-scratch code
+(and the LUT host's toggles) run the real weights. The published model itself, imported from
+Hugging Face `transformers`, is the profile's ground truth; we don't reimplement it. Nothing here
+patches or subclasses a Hugging Face class: the "hf" arm in eval/ runs the model exactly as
+`transformers` ships it.
 
 Profiles so far: GPT-2 (openai-community/gpt2 and its larger sizes).
 """

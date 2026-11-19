@@ -10,3 +10,4 @@ numpy
 pyyaml
 tqdm        # training progress bars with time estimates
 pytest
+transformers==5.23.0   # Hugging Face GPT-2 for python/reference/hf_gpt2.py (the GPT-2 profile and the hf arm)

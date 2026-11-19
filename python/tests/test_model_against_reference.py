@@ -1,4 +1,4 @@
-"""The from-scratch model (baseline/host.py) against the torch.nn reference (baseline/reference_torch.py).
+"""The from-scratch model (baseline/host.py) against the torch.nn reference (reference/torch_model.py).
 
 Given the same weights and tokens, both must produce the same logits, for every architecture
 option the config allows. Prefill plus decode with the KV cache must give the same logits as
@@ -18,7 +18,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from baseline import host  # noqa: E402
-from baseline import reference_torch as ref  # noqa: E402
+from reference import torch_model as ref  # noqa: E402
 from LUT import host as lut_host  # noqa: E402
 
 SMALL = host.TransformerConfig(name="test", vocab_size=37, context_length=24, d_model=32, n_heads=4,
