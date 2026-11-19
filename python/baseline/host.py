@@ -15,9 +15,9 @@ Which device runs which task (train, prefill, decode) comes from a hardware conf
     python -m baseline.host evaluate ...
     python -m baseline.host generate ... --prompt "Once upon a time"
 
-Status: the inference composition (forward, prefill, decode_step, generate) and init_params work
-and are checked against reference_torch.py. Training (forward_train, backward, train_step) and the
-train / evaluate / generate commands come next; the commands also need a tokenizer and dataset (D2).
+Status: inference (forward, prefill, decode_step, generate) and training (forward_train, backward,
+train_step) work and are checked against reference_torch.py and autograd. The train / evaluate /
+generate commands come next; they need a tokenizer and dataset (D2).
 """
 
 from __future__ import annotations
@@ -407,23 +407,6 @@ def forward(params: dict, token_ids: Tensor, ops: ModelOps, cfg: TransformerConf
     return _head(params, _residual_stream(params, token_ids, ops, cfg, None), ops, cfg)
 
 
-def forward_train(params: dict, token_ids: Any, ops: ModelOps, cfg: TransformerConfig) -> tuple[Any, list]:
-    """Full forward pass with caches for backward. Returns (logits (B, T, V), caches)."""
-    raise _todo("forward_train")
-
-
-def backward(d_logits: Any, caches: list, ops: ModelOps, cfg: TransformerConfig) -> dict:
-    """Backpropagate d_logits through the model in reverse order. Returns {param name: gradient},
-    with residual-branch gradients summed and tied-embedding gradients added together."""
-    raise _todo("backward")
-
-
-def train_step(params: dict, batch: Any, ops: ModelOps, opt_state: dict, cfg: TransformerConfig, *, lr: float) -> dict:
-    """forward_train -> cross_entropy -> backward -> clip_grad_norm -> adamw_step.
-    Returns {"loss", "grad_norm", "tokens"} for training_loop."""
-    raise _todo("train_step")
-
-
 def new_cache(params: dict, cfg: TransformerConfig, batch: int, max_len: int) -> inference.KVCache:
     """An empty KV cache for `batch` sequences of up to max_len tokens, on the parameters' device
     and dtype."""
@@ -473,6 +456,167 @@ def generate(params: dict, prompt_ids: Tensor, max_new_tokens: int, ops: ModelOp
         if step < max_new_tokens - 1:          # the last token doesn't need a forward pass
             logits = decode_step(params, next_id, cache, ops, cfg)
     return torch.cat(tokens, dim=1)
+
+
+# ----------------------------------------------------------------------------------------------
+# Training: the same composition with *_forward functions, then *_backward in reverse order
+# ----------------------------------------------------------------------------------------------
+#
+# In "train" mode every ops entry is a (forward, backward) pair. forward_train runs the model
+# exactly as forward() does, keeping each stage's cache; backward() walks the same steps in reverse,
+# applying the chain rule. Two rules from the composition carry over to the gradients:
+#   - a residual add x_out = x_in + branch(x_in) sends d_x_out both straight to x_in and through
+#     the branch, and the two contributions are summed;
+#   - a parameter used twice (the tied embedding: input lookup and output layer) gets the sum of
+#     both gradients.
+# split_heads and merge_heads are re-indexings, so each one's backward is the other.
+
+def _norm_forward(pair: tuple, x: Tensor, params: dict, prefix: str, cfg: TransformerConfig) -> tuple[Tensor, Any]:
+    if cfg.norm == "layernorm":
+        return pair[0](x, params[f"{prefix}.gamma"], params[f"{prefix}.beta"])
+    return pair[0](x, params[f"{prefix}.gamma"])
+
+
+def _norm_backward(pair: tuple, dy: Tensor, cache: Any, prefix: str, grads: dict, cfg: TransformerConfig) -> Tensor:
+    """Run a norm's backward, store d_gamma (and d_beta) in grads, return dx."""
+    out = pair[1](dy, cache)
+    grads[f"{prefix}.gamma"] = out[1]
+    if cfg.norm == "layernorm":
+        grads[f"{prefix}.beta"] = out[2]
+    return out[0]
+
+
+def _linear_backward(pair: tuple, dy: Tensor, cache: Any, w_name: str, b_name: str, grads: dict) -> Tensor:
+    """Run a linear stage's backward, store dW (and db) in grads, return dx."""
+    dx, dw, db = pair[1](dy, cache)
+    grads[w_name] = dw
+    if db is not None:
+        grads[b_name] = db
+    return dx
+
+
+def _attention_train(layer: dict, params: dict, p: str, h: Tensor, cfg: TransformerConfig) -> tuple[Tensor, dict]:
+    """Attention forward with caches (no KV cache: training sees whole sequences)."""
+    t = h.shape[1]
+    c: dict[str, Any] = {}
+    qkv = {}
+    for name in ("q", "k", "v"):
+        out, c[name] = layer["qkv_proj"][0](h, params[f"{p}.w{name}"], params.get(f"{p}.b{name}"))
+        qkv[name] = inference.split_heads(out, cfg.n_heads)
+    mask = inference.causal_mask(t, t, device=h.device)
+    s, c["scores"] = layer["attn_scores"][0](qkv["q"], qkv["k"], mask)
+    probs, c["softmax"] = layer["softmax"][0](s)
+    a, c["values"] = layer["attn_values"][0](probs, qkv["v"])
+    out, c["out"] = layer["out_proj"][0](inference.merge_heads(a), params[f"{p}.wo"], params.get(f"{p}.bo"))
+    return out, c
+
+
+def _attention_backward(layer: dict, d_out: Tensor, c: dict, p: str, grads: dict, cfg: TransformerConfig) -> Tensor:
+    """Reverse of _attention_train. Returns d_h, the gradient for the attention input."""
+    da = _linear_backward(layer["out_proj"], d_out, c["out"], f"{p}.wo", f"{p}.bo", grads)
+    d_probs, dv = layer["attn_values"][1](inference.split_heads(da, cfg.n_heads), c["values"])
+    ds = layer["softmax"][1](d_probs, c["softmax"])
+    dq, dk = layer["attn_scores"][1](ds, c["scores"])
+    d_h = 0
+    for name, d_heads in (("q", dq), ("k", dk), ("v", dv)):
+        d_h = d_h + _linear_backward(layer["qkv_proj"], inference.merge_heads(d_heads), c[name],
+                                     f"{p}.w{name}", f"{p}.b{name}", grads)
+    return d_h
+
+
+def _ffn_train(layer: dict, params: dict, p: str, h: Tensor) -> tuple[Tensor, dict]:
+    c: dict[str, Any] = {}
+    u, c["up"] = layer["ffn_up"][0](h, params[f"{p}.w1"], params.get(f"{p}.b1"))
+    z, c["act"] = layer["ffn_act"][0](u)
+    out, c["down"] = layer["ffn_down"][0](z, params[f"{p}.w2"], params.get(f"{p}.b2"))
+    return out, c
+
+
+def _ffn_backward(layer: dict, d_out: Tensor, c: dict, p: str, grads: dict) -> Tensor:
+    dz = _linear_backward(layer["ffn_down"], d_out, c["down"], f"{p}.w2", f"{p}.b2", grads)
+    du = layer["ffn_act"][1](dz, c["act"])
+    return _linear_backward(layer["ffn_up"], du, c["up"], f"{p}.w1", f"{p}.b1", grads)
+
+
+def forward_train(params: dict, token_ids: Tensor, ops: ModelOps, cfg: TransformerConfig) -> tuple[Tensor, dict]:
+    """Full forward pass with caches for backward. Returns (logits (B, T, V), caches)."""
+    if cfg.dropout:
+        raise NotImplementedError("dropout > 0 is not wired into forward_train yet (every config uses 0.0)")
+    caches: dict[str, Any] = {"T": token_ids.shape[1], "layers": []}
+    x, caches["embedding"] = ops.embedding[0](token_ids, params["tok_emb"])
+    t = token_ids.shape[1]
+    if cfg.positional_encoding == "learned":
+        x = x + params["pos_emb"][:t]
+    elif cfg.positional_encoding == "sinusoidal":
+        x = x + inference.sinusoidal_positions(t, cfg.d_model, device=x.device, dtype=x.dtype)
+    for i in range(cfg.n_layers):
+        layer, p, c = ops.layers[i], f"layers.{i}", {}
+        if cfg.norm_placement == "pre":
+            h, c["norm1"] = _norm_forward(layer["norm"], x, params, f"{p}.norm1", cfg)
+            attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", h, cfg)
+            x = x + attn
+            h, c["norm2"] = _norm_forward(layer["norm"], x, params, f"{p}.norm2", cfg)
+            ffn, c["ffn"] = _ffn_train(layer, params, f"{p}.ffn", h)
+            x = x + ffn
+        else:
+            attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", x, cfg)
+            x, c["norm1"] = _norm_forward(layer["norm"], x + attn, params, f"{p}.norm1", cfg)
+            ffn, c["ffn"] = _ffn_train(layer, params, f"{p}.ffn", x)
+            x, c["norm2"] = _norm_forward(layer["norm"], x + ffn, params, f"{p}.norm2", cfg)
+        caches["layers"].append(c)
+    h, caches["final_norm"] = _norm_forward(ops.final_norm, x, params, "norm_f", cfg)
+    weight = params["tok_emb"] if cfg.tie_embeddings else params["lm_head"]
+    logits, caches["lm_head"] = ops.lm_head[0](h, weight)
+    return logits, caches
+
+
+def backward(d_logits: Tensor, caches: dict, ops: ModelOps, cfg: TransformerConfig) -> dict[str, Tensor]:
+    """Backpropagate d_logits through the model in reverse order. Returns {param name: gradient},
+    with residual-branch gradients summed and tied-embedding gradients added together."""
+    grads: dict[str, Tensor] = {}
+    dh, d_head, _ = ops.lm_head[1](d_logits, caches["lm_head"])
+    dx = _norm_backward(ops.final_norm, dh, caches["final_norm"], "norm_f", grads, cfg)
+    for i in reversed(range(cfg.n_layers)):
+        layer, p, c = ops.layers[i], f"layers.{i}", caches["layers"][i]
+        if cfg.norm_placement == "pre":
+            # x_out = x_mid + ffn(norm2(x_mid)): dx reaches x_mid directly and through the branch.
+            d_branch = _ffn_backward(layer, dx, c["ffn"], f"{p}.ffn", grads)
+            dx = dx + _norm_backward(layer["norm"], d_branch, c["norm2"], f"{p}.norm2", grads, cfg)
+            # x_mid = x_in + attn(norm1(x_in))
+            d_branch = _attention_backward(layer, dx, c["attn"], f"{p}.attn", grads, cfg)
+            dx = dx + _norm_backward(layer["norm"], d_branch, c["norm1"], f"{p}.norm1", grads, cfg)
+        else:
+            # x_out = norm2(x_mid + ffn(x_mid)), then x_mid = norm1(x_in + attn(x_in))
+            d_sum = _norm_backward(layer["norm"], dx, c["norm2"], f"{p}.norm2", grads, cfg)
+            dx = d_sum + _ffn_backward(layer, d_sum, c["ffn"], f"{p}.ffn", grads)
+            d_sum = _norm_backward(layer["norm"], dx, c["norm1"], f"{p}.norm1", grads, cfg)
+            dx = d_sum + _attention_backward(layer, d_sum, c["attn"], f"{p}.attn", grads, cfg)
+    d_table = ops.embedding[1](dx, caches["embedding"])
+    if cfg.tie_embeddings:
+        grads["tok_emb"] = d_table + d_head          # used twice: input lookup and output layer
+    else:
+        grads["tok_emb"], grads["lm_head"] = d_table, d_head
+    if cfg.positional_encoding == "learned":
+        # x = tok + pos_emb[:T] broadcast over the batch, so each used row gets dx summed over B.
+        t = caches["T"]
+        d_pos = torch.zeros(cfg.context_length, cfg.d_model, device=dx.device, dtype=dx.dtype)
+        d_pos[:t] = dx.sum(dim=0)
+        grads["pos_emb"] = d_pos
+    return grads
+
+
+def train_step(params: dict, batch: Any, ops: ModelOps, opt_state: dict, cfg: TransformerConfig, *, lr: float,
+               max_grad_norm: float = 1.0, weight_decay: float = 0.1) -> dict:
+    """forward_train -> cross_entropy -> backward -> clip_grad_norm -> adamw_step.
+    batch is (inputs, targets), both (B, T). Updates params in place.
+    Returns {"loss", "grad_norm", "tokens", "lr"} for training_loop."""
+    inputs, targets = batch
+    logits, caches = forward_train(params, inputs, ops, cfg)
+    loss, loss_cache = train.cross_entropy_forward(logits, targets)
+    grads = backward(train.cross_entropy_backward(loss_cache), caches, ops, cfg)
+    grad_norm = train.clip_grad_norm(grads, max_grad_norm)
+    train.adamw_step(params, grads, opt_state, lr=lr, weight_decay=weight_decay)
+    return {"loss": float(loss), "grad_norm": grad_norm, "tokens": int(targets.numel()), "lr": lr}
 
 
 # ----------------------------------------------------------------------------------------------
