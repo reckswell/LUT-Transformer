@@ -1,0 +1,5 @@
+name: gpu               # RTX 5080 for everything
+devices:
+  train: cuda
+  prefill: cuda
+  decode: cuda

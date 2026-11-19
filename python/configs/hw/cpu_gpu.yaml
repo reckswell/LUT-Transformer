@@ -1,0 +1,7 @@
+# Example split: train and prefill on the GPU, decode on the CPU. Other splits are just other files.
+# FPGA configurations (CPU + FPGA, GPU + FPGA, FPGA only) are added in the HLS phase.
+name: cpu_gpu
+devices:
+  train: cuda
+  prefill: cuda
+  decode: cpu

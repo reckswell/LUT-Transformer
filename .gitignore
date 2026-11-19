@@ -1,0 +1,36 @@
+# Papers are copyrighted and this repository is public: never commit PDFs.
+papers/*.pdf
+papers/**/*.pdf
+papers/text/
+
+# Datasets, checkpoints and large artifacts
+data/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+
+# Raw power samples can be large; summaries and metrics are committed.
+results/runs/*/power_samples.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Editors and local settings
+.vscode/
+.idea/
+.claude/settings.local.json
+.env
+.env.*
+
+# Vendor tool output (for the later HLS phase)
+.Xil/
+*.log
+*.jou
+hls/**/build/

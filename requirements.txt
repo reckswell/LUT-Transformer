@@ -1,0 +1,12 @@
+# Python 3.10 or newer.
+#
+# PyTorch: the RTX 5080 (Blackwell) needs a build with CUDA 12.8 or newer. Install it first,
+# from the selector at pytorch.org, for example:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# then the rest:
+#   pip install -r requirements.txt
+torch>=2.7
+numpy
+pyyaml
+tqdm        # training progress bars with time estimates
+pytest

@@ -1,0 +1,19 @@
+# Model shape and architecture. Placeholder values until Alpha settles the window 1 decisions
+# (D1). Every field is read by baseline/host.py:TransformerConfig.
+name: tiny
+vocab_size: null              # set from the tokenizer once the dataset is chosen
+context_length: 256
+d_model: 256
+n_heads: 4
+n_layers: 4
+d_ff: 1024
+
+# DECISION D1: each of these is an open architecture choice. Values below are the GPT-2-style
+# defaults proposed in the project plan, pending Alpha's answer.
+norm: layernorm               # layernorm | rmsnorm
+norm_placement: pre           # pre | post
+activation: gelu              # relu | gelu
+positional_encoding: learned  # sinusoidal | learned
+tie_embeddings: true
+bias: true
+dropout: 0.0

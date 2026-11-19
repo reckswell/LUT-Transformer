@@ -1,0 +1,6 @@
+# Hardware configuration: which device runs each task. Logged with every run.
+name: cpu
+devices:
+  train: cpu
+  prefill: cpu
+  decode: cpu
