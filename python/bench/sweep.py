@@ -7,9 +7,16 @@ time remaining while it runs (Alpha, 2026-11-19).
     python -m bench.sweep                              # run every enabled row of configs/sweep/models.csv
     python -m bench.sweep --only core_cpu,gpt2_cpu     # just these rows
     python -m bench.sweep --csv configs/sweep/other.csv --no-power
+    python -m bench.sweep --allow-gaps                 # run even if a row misses a cell the lut rows measure
 
 The CSV: one row per thing to measure, columns in any order, lines starting with # are comments.
 configs/sweep/models.csv is the example to copy. Required columns: enabled, name, arm, model, device.
+One comment line may set sweep-wide defaults for blank benchmarks and datasets cells, so every row
+measures the same things by construction:
+
+    # defaults: benchmarks=speed;perplexity datasets=tinystories
+
+A row with random weights takes only the speed part of the default (random weights are speed only).
 
     enabled          yes | no (also y/n, true/false, 1/0; blank means yes). "no" rows are listed
                      in the plan as skipped.
@@ -78,12 +85,25 @@ speed, for each context length T (float32, TF32 off: common/precision.py):
     Idle power is sampled once, before anything is loaded.
   - timing in PyTorch measures emulation for LUT and integer stages, not FPGA speed (agent.md 2.6).
 
-perplexity, for each dataset: the dataset's evaluation split, tokenized with the model's own
-tokenizer (at most the dataset's token limit, or --max-eval-tokens), read in windows of the model's
-context length W (1,024 for GPT-2) that start every W/2 tokens. Each window is one forward pass, and
-only the tokens a window adds are scored, each with at least W/2 tokens of context (Hugging Face's
-method for fixed-length models). perplexity = exp(mean next-token cross-entropy), the loss in
-float64, the same for every arm. Every token after the first is scored once.
+perplexity, for each dataset: the same text for every model (common/data.py eval_text): the
+dataset's evaluation split with its document separators replaced by blank lines, cut to the
+dataset's character limit (or --max-eval-chars) at the last whitespace. It is tokenized with each
+model's own tokenizer and read in windows of the model's context length W (1,024 for GPT-2, 256 for
+stories15M) that start every W/2 tokens. Each window is one forward pass, and only the tokens a window
+adds are scored, each with at least W/2 tokens of context (Hugging Face's method for fixed-length
+models). The loss is in float64, the same for every arm, and every token after the first is scored
+once. Recorded with each result: the dataset file's sha256, the window and stride, and
+    nll_total        sum of -ln p(token | context) over every scored token, in nats
+    perplexity       exp(nll_total / scored tokens)       per token: depends on the tokenizer
+    bits_per_byte    nll_total / (ln 2 * UTF-8 bytes of the text)      compare across tokenizers
+    word_perplexity  exp(nll_total / whitespace-separated words)       compare across tokenizers
+
+Cross-checking (Alpha, 2026-11-19: every model must "cross check datasets" with Alpha's own model).
+Alpha's model is the lut arm. Before anything runs, every row to run must cover the same (dataset,
+benchmark) cells as the lut rows to run: speed on synthetic tokens, and perplexity on each of their
+datasets. Rows with random weights are held to the speed cells only. A row that misses a cell
+stops the sweep before anything runs, with the missing cells named; --allow-gaps runs it anyway.
+The plan prints the coverage matrix (rows by cells) either way.
 
 Time estimates. Before the sweep starts it prints a plan: each row, whether it was trained before,
 its estimated time, where the estimate came from, and the total. An estimate comes from
@@ -110,8 +130,14 @@ Results:
                                               the rows that need training), summary.csv (one line
                                               per row, benchmark and context length or dataset: the
                                               numbers above, the run id, estimated and actual time),
+                                              results_long.csv (one line per row, dataset,
+                                              benchmark, metric and context length, with its value
+                                              and unit: the layout for a spreadsheet's pivot table),
                                               status.json
-Git ignores only the raw power samples (power_samples*.json); the rest can be committed.
+  results/all_results.csv                     results_long.csv of every sweep, appended after every
+                                              row; a run id already in it is never added twice
+Git ignores only the raw power samples (power_samples*.json); the rest can be committed. The CSVs
+are plain UTF-8 with a header row and open directly in Excel.
 """
 
 from __future__ import annotations
@@ -172,8 +198,8 @@ PHASES = ("prefill", "decode")
 CALIBRATION_DECODE_STEPS = 4      # decode steps per context length in a calibration run
 OVERHEAD_S = 1.0                  # per row: run folder, system info, cache and prompt setup
 UNKNOWN_ROW_S = 60.0              # bar weight for a row with no estimate (only with --no-calibrate)
-CHARS_PER_TOKEN_BOUND = 10        # text kept before tokenizing a capped split: 10 characters per token
-                                  # (English runs about 4), so the cap, not the cut, sets the length
+SPEED_CELL = ("synthetic", "speed")   # the speed benchmark's (dataset, benchmark) cell
+LN2 = math.log(2.0)
 
 
 class SweepError(ValueError):
@@ -243,8 +269,53 @@ def _list(text: str) -> list[str]:
     return [part.strip().lower() for part in text.split(";") if part.strip()]
 
 
-def _parse_row(values: dict[str, str], line: int) -> Row:
-    """One row's cells -> Row. Raises SweepError listing every bad cell in the row."""
+@dataclass
+class Defaults:
+    """Sweep-wide values for blank benchmarks and datasets cells (a '# defaults:' line in the CSV)."""
+
+    benchmarks: list[str] = field(default_factory=list)
+    datasets: list[str] = field(default_factory=list)
+    line: int | None = None
+
+    def describe(self) -> str:
+        parts = [f"benchmarks={';'.join(self.benchmarks)}"] if self.benchmarks else []
+        parts += [f"datasets={';'.join(self.datasets)}"] if self.datasets else []
+        return " ".join(parts)
+
+
+DEFAULTS_KEYS = ("benchmarks", "datasets")
+
+
+def parse_defaults(lines: list[str], csv_name: str) -> tuple[Defaults, list[str]]:
+    """Find the '# defaults: benchmarks=speed;perplexity datasets=tinystories' comment line, if any.
+    Returns (Defaults, errors). Keys are separated by spaces or commas; values by ';'."""
+    found = [(number, line) for number, line in enumerate(lines, 1)
+             if line.lstrip().startswith("#") and line.lstrip("# \t").lower().startswith("defaults:")]
+    if not found:
+        return Defaults(), []
+    errors = [f"{csv_name} line {n}: a second '# defaults:' line (only one is allowed)" for n, _ in found[1:]]
+    number, line = found[0]
+    defaults = Defaults(line=number)
+    body = line.lstrip("# \t")[len("defaults:"):]
+    for item in [part for part in re.split(r"[\s,]+", body) if part]:
+        key, _, value = item.partition("=")
+        key = key.strip().lower()
+        if key not in DEFAULTS_KEYS or not value:
+            errors.append(f"{csv_name} line {number}: '# defaults:' takes {' and '.join(k + '=a;b' for k in DEFAULTS_KEYS)}, "
+                          f"got {item!r}")
+            continue
+        setattr(defaults, key, _list(value))
+    unknown = [b for b in defaults.benchmarks if b not in BENCHMARKS]
+    unknown += [d for d in defaults.datasets if d not in data.DATASETS]
+    if unknown:
+        errors.append(f"{csv_name} line {number}: unknown default(s) {', '.join(unknown)}")
+    return defaults, errors
+
+
+def _parse_row(values: dict[str, str], line: int, defaults: Defaults | None = None) -> Row:
+    """One row's cells -> Row, with blank benchmarks and datasets cells taken from the CSV's
+    defaults. Raises SweepError listing every bad cell in the row."""
+    defaults = defaults or Defaults()
     problems: list[str] = []
 
     def check(fn: Callable[[], Any], default: Any) -> Any:
@@ -285,11 +356,18 @@ def _parse_row(values: dict[str, str], line: int) -> Row:
     if not re.fullmatch(r"cpu|cuda(:\d+)?", device):
         problems.append(f"device must be cpu, cuda or cuda:N, got {values.get('device')!r}")
 
-    benchmarks = _list(values.get("benchmarks", "")) or ["speed"]
+    # Blank cells take the CSV's defaults. Random weights (the core, unless the row says otherwise)
+    # take only the speed part: perplexity of random weights measures nothing.
+    effective_weights = weights or ("random" if model == "core" else "pretrained")
+    benchmarks = _list(values.get("benchmarks", ""))
+    if not benchmarks:
+        benchmarks = [b for b in defaults.benchmarks if b == "speed" or effective_weights == "pretrained"] or ["speed"]
     unknown = [b for b in benchmarks if b not in BENCHMARKS]
     if unknown:
         problems.append(f"benchmarks must be from {', '.join(BENCHMARKS)}, got {', '.join(unknown)}")
     datasets = _list(values.get("datasets", ""))
+    if not datasets and "perplexity" in benchmarks:
+        datasets = list(defaults.datasets)
     unknown = [d for d in datasets if d not in data.DATASETS]
     if unknown:
         problems.append(f"unknown dataset(s) {', '.join(unknown)}; known: {', '.join(data.DATASETS)} "
@@ -334,7 +412,11 @@ def read_csv(path: Path) -> tuple[list[Row], list[str]]:
     path = Path(path)
     if not path.is_file():
         return [], [f"{path}: no such file"]
-    numbered = [(number, line) for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+    all_lines = path.read_text(encoding="utf-8").splitlines()
+    defaults, default_errors = parse_defaults(all_lines, path.name)
+    if default_errors:
+        return [], default_errors
+    numbered = [(number, line) for number, line in enumerate(all_lines, 1)
                 if line.strip() and not line.lstrip().startswith("#")]
     if not numbered:
         return [], [f"{path.name}: no header row"]
@@ -357,7 +439,7 @@ def read_csv(path: Path) -> tuple[list[Row], list[str]]:
             continue
         values = {column: (cells[i].strip() if i < len(cells) else "") for i, column in enumerate(header)}
         try:
-            rows.append(_parse_row(values, number))
+            rows.append(_parse_row(values, number, defaults))
         except SweepError as error:
             errors.append(f"{path.name} line {number} ({values.get('name') or '?'}): {error}")
     names = [row.name for row in rows]
@@ -489,7 +571,8 @@ class Settings:
     seed: int = 0
     download: bool = False
     calibrate: bool = True
-    max_eval_tokens: int | None = None     # None: each dataset's eval_token_limit; 0: the whole split
+    max_eval_chars: int | None = None      # None: each dataset's eval_char_limit; 0: the whole split
+    allow_gaps: bool = False               # run rows that miss a cell the lut rows measure
     results_dir: Path = REPO_ROOT / "results"
     history_path: Path = field(default_factory=lambda: local_cache.LOCAL_DIR / "sweep-history.jsonl")
     checkpoint_dir: Path = field(default_factory=lambda: local_cache.CHECKPOINT_DIR)
@@ -780,12 +863,25 @@ def measure_context(runner: OurRunner | HFRunner, ids: Tensor, decode_tokens: in
 _TOKENS: dict[tuple[Any, ...], tuple[Tensor, float]] = {}
 
 
-def token_limit(name: str, settings: Settings) -> int | None:
-    """How many tokens of the dataset perplexity reads: --max-eval-tokens (0 = all), else the
-    dataset's own limit."""
-    if settings.max_eval_tokens is not None:
-        return settings.max_eval_tokens or None
-    return data.DATASETS[name].eval_token_limit
+def char_limit(name: str, settings: Settings) -> int | None:
+    """How many characters of the dataset's split perplexity reads, the same for every model:
+    --max-eval-chars (0 = all), else the dataset's own limit. None means the whole split."""
+    if settings.max_eval_chars is not None:
+        return settings.max_eval_chars or None
+    return data.DATASETS[name].eval_char_limit
+
+
+_TEXTS: dict[tuple[str, int | None], data.EvalText] = {}
+
+
+def eval_text(name: str, settings: Settings) -> data.EvalText:
+    """The exact text perplexity reads for this dataset (common/data.py eval_text), cached for the
+    sweep: every row, whatever its model, gets this same object."""
+    limit = char_limit(name, settings)
+    key = (name, limit)
+    if key not in _TEXTS:
+        _TEXTS[key] = data.eval_text(data.DATASETS[name], limit if limit is not None else 0)
+    return _TEXTS[key]
 
 
 def load_tokenizer(source: ModelSource, settings: Settings) -> Any:
@@ -799,18 +895,14 @@ def load_tokenizer(source: ModelSource, settings: Settings) -> Any:
 
 
 def eval_tokens(source: ModelSource, name: str, settings: Settings) -> tuple[Tensor, float]:
-    """(the dataset's evaluation split as token ids (N,), seconds it took to read and tokenize),
-    cached for the rest of the sweep."""
-    limit = token_limit(name, settings)
-    key = (source.key, name, limit)
+    """(the dataset's evaluation text, eval_text, as this model's token ids (N,), seconds it took to
+    tokenize), cached for the rest of the sweep. Every model tokenizes the same text, so token
+    counts differ between tokenizers while the text does not."""
+    text = eval_text(name, settings)
+    key = (source.key, name, text.char_limit)
     if key not in _TOKENS:
         start = time.perf_counter()
-        text = data.load_text(data.DATASETS[name])
-        if limit:
-            text = text[: limit * CHARS_PER_TOKEN_BOUND]
-        ids = load_tokenizer(source, settings)(text, return_attention_mask=False)["input_ids"]
-        if limit:
-            ids = ids[:limit]
+        ids = load_tokenizer(source, settings)(text.text, return_attention_mask=False)["input_ids"]
         if len(ids) < 2:
             raise SweepError(f"dataset {name} gave {len(ids)} token(s); perplexity needs at least 2")
         _TOKENS[key] = (torch.tensor(ids, dtype=torch.int64), time.perf_counter() - start)
@@ -861,10 +953,101 @@ def measure_perplexity(forward: Callable[[Tensor], Tensor], tokens: Tensor, *, w
         if end == n:
             break
         prev_end, begin = end, begin + stride
-    return {"perplexity": math.exp(nll / scored), "nll_per_token": nll / scored, "eval_tokens": n,
+    return {"perplexity": math.exp(nll / scored), "nll_per_token": nll / scored, "nll_total": nll, "eval_tokens": n,
             "scored_tokens": scored, "eval_window": window, "eval_stride": stride, "eval_windows": windows,
             "eval_s": time.perf_counter() - started, "forward_ms_median": statistics.median(forward_ms),
             "window_s_median": statistics.median(window_s)}
+
+
+def text_metrics(nll_total: float, n_bytes: int, n_words: int) -> dict[str, float]:
+    """Perplexity measures that don't depend on the tokenizer, from the total negative log-likelihood
+    of one text (nats, summed over every scored token):
+
+        bits_per_byte   = nll_total / (ln 2 * n_bytes)     n_bytes = UTF-8 bytes of the evaluated text
+        word_perplexity = exp(nll_total / n_words)         n_words = its whitespace-separated words
+
+    Token perplexity, exp(nll_total / scored tokens), divides by however many tokens the tokenizer
+    cut the text into, so it only compares models that share a tokenizer. These two divide the same
+    total by counts that belong to the text, so they compare across tokenizers
+    (lm-evaluation-harness reports the same two). Dividing by ln 2 turns nats into bits. Caveat: a
+    tokenizer that adds no BOS token (GPT-2's) leaves the text's first token unscored, so its total
+    misses one token in hundreds of thousands.
+    """
+    if n_bytes <= 0 or n_words <= 0:
+        raise ValueError(f"the evaluated text must have bytes and words, got {n_bytes} bytes and {n_words} words")
+    return {"bits_per_byte": nll_total / (LN2 * n_bytes), "word_perplexity": math.exp(nll_total / n_words)}
+
+
+# ----------------------------------------------------------------------------------------------
+# Cross-checking: every row measures what Alpha's own model (the lut rows) measures
+# ----------------------------------------------------------------------------------------------
+
+def row_cells(row: Row) -> set[tuple[str, str]]:
+    """The (dataset, benchmark) cells a row measures: speed on synthetic tokens, and perplexity on
+    each of its datasets."""
+    cells = {SPEED_CELL} if row.runs_speed else set()
+    return cells | {(name, "perplexity") for name in row.eval_datasets}
+
+
+def cell_label(cell: tuple[str, str]) -> str:
+    return "speed" if cell == SPEED_CELL else f"ppl:{cell[0]}"
+
+
+def _cell_order(cell: tuple[str, str]) -> tuple[int, str]:
+    return (0, "") if cell == SPEED_CELL else (1, cell[0])
+
+
+@dataclass
+class Coverage:
+    """reference: the cells the lut rows (Alpha's model) measure, together. gaps: row name -> the
+    reference cells that row doesn't measure (random-weight rows only owe the speed cells)."""
+
+    reference: set[tuple[str, str]]
+    lut_rows: list[str]
+    gaps: dict[str, list[tuple[str, str]]]
+
+
+def check_coverage(rows: list[Row]) -> Coverage:
+    """Compare every row that will run (rows marked weights=train never run) with the lut rows."""
+    runnable = [row for row in rows if row.weights != "train"]
+    lut = [row for row in runnable if row.arm == "lut"]
+    reference: set[tuple[str, str]] = set().union(*(row_cells(row) for row in lut))
+    gaps = {}
+    for row in runnable:
+        owed = reference if row.weights != "random" else {c for c in reference if c == SPEED_CELL}
+        missing = sorted(owed - row_cells(row), key=_cell_order)
+        if missing:
+            gaps[row.name] = missing
+    return Coverage(reference, [row.name for row in lut], gaps)
+
+
+def format_coverage(rows: list[Row], coverage: Coverage) -> str:
+    """The coverage matrix: one line per row (lut rows marked *), one column per cell.
+        x    measured
+        GAP  not measured, but the lut rows measure it
+        .    not measured, and not owed (another row's extra, or perplexity for random weights)"""
+    runnable = [row for row in rows if row.weights != "train"]
+    cells = sorted(set(coverage.reference).union(*(row_cells(row) for row in runnable)), key=_cell_order)
+    header = ["row", "arm", "model", "weights"] + [cell_label(c) for c in cells]
+    table = [header]
+    for row in runnable:
+        have, missing = row_cells(row), set(coverage.gaps.get(row.name, []))
+        marks = ["x" if c in have else "GAP" if c in missing else "." for c in cells]
+        name = row.name + (" *" if row.arm == "lut" else "")
+        table.append([name, row.arm, row.model, row.weights or "-"] + marks)
+    widths = [max(len(line[i]) for line in table) for i in range(len(header))]
+    lines = ["Coverage (* = Alpha's model, the lut rows; every other row must measure what they measure):"]
+    lines += ["  " + "  ".join(cell.ljust(width) for cell, width in zip(line, widths)).rstrip() for line in table]
+    if not coverage.lut_rows:
+        lines.append("  No lut row runs, so there is nothing to cross-check against.")
+    elif not coverage.gaps:
+        lines.append("  Every row covers the lut rows' cells.")
+    return "\n".join(lines)
+
+
+def coverage_errors(coverage: Coverage) -> list[str]:
+    return [f"{name} does not measure {', '.join(cell_label(c) for c in missing)}, which the lut rows "
+            f"({', '.join(coverage.lut_rows)}) measure" for name, missing in coverage.gaps.items()]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1037,7 +1220,7 @@ def estimate_from_history(row: Row, source: ModelSource, history: list[dict[str,
             prefill[int(length)] = values["prefill_ms"]
             decode[int(length)] = values.get("decode_ms") or 0.0
         for name, values in record.get("perplexity", {}).items():
-            if values.get("limit") == token_limit(name, settings):
+            if values.get("limit") == char_limit(name, settings):
                 perplexity[name] = values
     if (row.runs_speed and not prefill) or any(name not in perplexity for name in row.eval_datasets):
         return None
@@ -1169,9 +1352,18 @@ def format_plan(entries: list[PlanEntry], settings: Settings, power_info: dict[s
         lines.append(f"Trained before, used as they are (no training): {', '.join(pretrained)}.")
     datasets = sorted({d for e in runnable for d in e.row.eval_datasets})
     for name in datasets:
-        limit = token_limit(name, settings)
-        lines.append(f"Dataset {name}: {data.DATASETS[name].eval_split} split, "
-                     f"{'all of it' if limit is None else f'first {limit:,} tokens'}, from {data.DATASET_DIR / name}.")
+        limit, spec = char_limit(name, settings), data.DATASETS[name]
+        sha = f", file sha256 {data.file_sha256(spec.path())[:16]}" if data.is_installed(spec) else ""
+        lines.append(f"Dataset {name}: {spec.eval_split} split, "
+                     f"{'all of it' if limit is None else f'first {limit:,} characters'}, the same text for every "
+                     f"model{sha}, from {data.DATASET_DIR / name}.")
+    defaults, _ = parse_defaults(Path(settings.csv_path).read_text(encoding="utf-8").splitlines(),
+                                 Path(settings.csv_path).name) if Path(settings.csv_path).is_file() else (Defaults(), [])
+    if defaults.line:
+        lines.append(f"Defaults for blank cells (line {defaults.line}): {defaults.describe()}.")
+    if runnable:
+        rows = [e.row for e in runnable]
+        lines.append(format_coverage(rows, check_coverage(rows)))
     if settings.power and any(e.row.runs_speed for e in runnable):
         for target, info in sorted(power_info.items()):
             if info["available"]:
@@ -1195,9 +1387,35 @@ SUMMARY_COLUMNS = (
     "prefill_ms_p90", "prefill_tokens_per_s", "decode_ms_per_token_median", "decode_ms_p10", "decode_ms_p90",
     "decode_tokens_per_s", "power_source", "idle_power_w", "prefill_power_w", "prefill_energy_per_token_mj",
     "decode_power_w", "decode_energy_per_token_mj", "power_note", "perplexity", "nll_per_token", "eval_tokens",
+    "nll_total", "eval_chars", "eval_bytes", "eval_words", "bits_per_byte", "word_perplexity", "dataset_sha256",
     "eval_window", "eval_stride", "eval_windows", "eval_s", "forward_ms_median", "estimated_row_s", "actual_row_s",
     "estimate_source",
 )
+
+# results_long.csv and all_results.csv: one line per row, dataset, benchmark, metric and context
+# length, the layout a spreadsheet's pivot table wants. Units are in the unit column, or in the
+# column name where it is one fixed unit (context_tokens, eval_window_tokens, eval_stride_tokens).
+LONG_COLUMNS = (
+    "timestamp_utc", "sweep_id", "run_id", "git_commit", "row", "model", "arm", "weights", "lut_preset",
+    "stage_toggles", "device", "dtype", "benchmark", "dataset", "dataset_sha256", "context_tokens", "batch",
+    "decode_tokens", "repeats", "eval_window_tokens", "eval_stride_tokens", "metric", "value", "unit", "note",
+)
+# metric (a summary.csv column) -> unit, in the order they are written
+SPEED_METRICS = {
+    "prefill_ms_median": "ms", "prefill_ms_p10": "ms", "prefill_ms_p90": "ms", "prefill_tokens_per_s": "tokens/s",
+    "decode_ms_per_token_median": "ms/token", "decode_ms_p10": "ms/token", "decode_ms_p90": "ms/token",
+    "decode_tokens_per_s": "tokens/s", "idle_power_w": "W", "prefill_power_w": "W",
+    "prefill_energy_per_token_mj": "mJ/token", "decode_power_w": "W", "decode_energy_per_token_mj": "mJ/token",
+}
+PERPLEXITY_METRICS = {
+    "perplexity": "per token", "nll_total": "nats", "nll_per_token": "nats/token", "eval_tokens": "tokens",
+    "eval_chars": "chars", "eval_bytes": "bytes", "eval_words": "words", "bits_per_byte": "bits/byte",
+    "word_perplexity": "per word", "eval_windows": "windows", "eval_s": "s", "forward_ms_median": "ms",
+}
+METRIC_NOTES = {
+    "perplexity": "token perplexity depends on the tokenizer; compare models with bits_per_byte or word_perplexity",
+    "eval_tokens": "scored tokens of this model's tokenizer",
+}
 
 
 def context_stats(prefill_ms: list[float], decode_ms: list[float], row: Row, length: int) -> dict[str, Any]:
@@ -1310,11 +1528,15 @@ def _measure_perplexity(row: Row, runner: Any, loaded: Loaded, entry: PlanEntry,
 
         stats = measure_perplexity(runner.forward, tokens, window=window, stride=stride, device=row.device,
                                    after_window=after_window)
-        stats["tokenize_s"] = tokenize_s
-        stats["split"] = data.DATASETS[name].eval_split
+        text = eval_text(name, settings)
+        stats.update(text_metrics(stats["nll_total"], text.utf8_bytes, text.words))
+        stats.update({"tokenize_s": tokenize_s, "split": text.split, "dataset_sha256": text.file_sha256,
+                      "char_limit": text.char_limit, "eval_chars": text.chars, "eval_bytes": text.utf8_bytes,
+                      "eval_words": text.words})
         run.log(kind="perplexity", dataset=name, **stats)
         results[name] = stats
-        write(f"{row.name} perplexity {name}: {stats['perplexity']:.3f} over {stats['scored_tokens']:,} tokens "
+        write(f"{row.name} perplexity {name}: {stats['perplexity']:.3f} per token over {stats['scored_tokens']:,} tokens, "
+              f"{stats['bits_per_byte']:.4f} bits/byte, word perplexity {stats['word_perplexity']:.3f} "
               f"({stats['eval_windows']} windows of {window}, stride {stride}, {stats['eval_s']:.1f} s)")
     return results
 
@@ -1350,8 +1572,10 @@ def run_row(entry: PlanEntry, settings: Settings, models: ModelCache, idle: dict
                   if entry.source.kind == "core" else entry.source.load_name, "dtype": dtype,
                   "power": {"on": entry.power_on, "seconds": settings.power_seconds,
                             "warmup_s": settings.power_warmup_s},
-                  "perplexity": {name: {"split": data.DATASETS[name].eval_split, "token_limit": token_limit(name, settings),
-                                        "file": str(data.DATASETS[name].path())} for name in row.eval_datasets}})
+                  "perplexity": {name: {"split": data.DATASETS[name].eval_split, "char_limit": char_limit(name, settings),
+                                        "file": str(data.DATASETS[name].path()),
+                                        "file_sha256": eval_text(name, settings).file_sha256}
+                                 for name in row.eval_datasets}})
     speed_steps = (settings.warmup + row.repeats + (len(row_phases(row)) if entry.power_on else 0)) \
         * len(row.context_lengths) if row.runs_speed else 0
     window_steps = sum(int(estimate.per_dataset.get(n, {}).get("windows", 0)) for n in row.eval_datasets)
@@ -1410,8 +1634,9 @@ def run_row(entry: PlanEntry, settings: Settings, models: ModelCache, idle: dict
         lines.append({k: _round(v) for k, v in line.items()})
     for name, stats in per_dataset.items():
         line = {**common, "benchmark": "perplexity", "dataset": name, "batch": 1,
-                **{k: stats[k] for k in ("perplexity", "nll_per_token", "eval_window", "eval_stride", "eval_windows",
-                                         "eval_s", "forward_ms_median")},
+                **{k: stats[k] for k in ("perplexity", "nll_per_token", "nll_total", "eval_chars", "eval_bytes",
+                                         "eval_words", "bits_per_byte", "word_perplexity", "dataset_sha256",
+                                         "eval_window", "eval_stride", "eval_windows", "eval_s", "forward_ms_median")},
                 "eval_tokens": stats["scored_tokens"], "power_note": "no power measured for perplexity"}
         lines.append({k: _round(v) for k, v in line.items()})
 
@@ -1428,8 +1653,87 @@ def run_row(entry: PlanEntry, settings: Settings, models: ModelCache, idle: dict
                                     "decode_ms": s.get("decode_ms_per_token_median")} for t, s in per_context.items()},
               "perplexity": {name: {"window_s": s["window_s_median"], "windows": s["eval_windows"],
                                     "tokenize_s": s["tokenize_s"], "window": s["eval_window"],
-                                    "limit": token_limit(name, settings)} for name, s in per_dataset.items()}}
+                                    "limit": char_limit(name, settings)} for name, s in per_dataset.items()}}
+    record["long"] = long_rows(lines, run, toggle_string(row, loaded))
     return lines, record
+
+
+def toggle_string(row: Row, loaded: Loaded) -> str:
+    """The lut arm's stage settings in one cell: every stage that isn't plain BASE, as
+    stage=what[k x b -> out]@layers/quant, joined by ';'; "all BASE" when there is none. Empty for
+    the hf and baseline arms."""
+    if row.arm != "lut":
+        return ""
+    from LUT import ops_registry
+
+    parts = []
+    for item in ops_registry.describe(lut_host.preset_toggles(row.lut_preset), loaded.cfg):
+        if item["runs"] == "not in this model" or (item["runs"].startswith("base:") and item["quant"] == "float"):
+            continue
+        part = f"{item['stage']}={item['runs']}"
+        part += f"[{item['shape']}]" if item["shape"] != "-" else ""
+        part += f"@{item['layers']}" if item["layers"] not in ("all", "-") else ""
+        part += f"/{item['quant']}" if item["quant"] != "float" else ""
+        parts.append(part)
+    return ";".join(parts) or "all BASE"
+
+
+def long_rows(lines: list[dict[str, Any]], run: Run, toggles: str) -> list[dict[str, Any]]:
+    """The row's summary lines in long format (LONG_COLUMNS): one line per metric with a value, with
+    its unit. Missing values (power that couldn't be read) are left out, not written as blanks."""
+    git = run.git or {}
+    commit = (git.get("commit") or "")[:10] + ("+dirty" if git.get("dirty") else "")
+    stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    out = []
+    for line in lines:
+        speed = line["benchmark"] == "speed"
+        common = {
+            "timestamp_utc": stamp, "sweep_id": line["sweep_id"], "run_id": line["run_id"], "git_commit": commit,
+            "row": line["row"], "model": line["model"], "arm": line["arm"], "weights": line["weights"],
+            "lut_preset": line["lut_preset"], "stage_toggles": toggles, "device": line["device"],
+            "dtype": line["dtype"], "benchmark": line["benchmark"], "dataset": line["dataset"],
+            "dataset_sha256": "" if speed else line.get("dataset_sha256", ""),
+            "context_tokens": line.get("context", "") if speed else "", "batch": line.get("batch", ""),
+            "decode_tokens": line.get("decode_tokens", "") if speed else "",
+            "repeats": line.get("repeats", "") if speed else "",
+            "eval_window_tokens": "" if speed else line.get("eval_window", ""),
+            "eval_stride_tokens": "" if speed else line.get("eval_stride", ""),
+        }
+        for metric, unit in (SPEED_METRICS if speed else PERPLEXITY_METRICS).items():
+            value = line.get(metric)
+            if value is None or value == "":
+                continue
+            note = METRIC_NOTES.get(metric, "")
+            if metric.endswith("power_w") or metric.endswith("_mj"):
+                note = line.get("power_source") or ""
+            out.append({**common, "metric": metric, "value": value, "unit": unit, "note": note})
+    return out
+
+
+def append_cumulative(path: Path, rows: list[dict[str, Any]]) -> tuple[int, int]:
+    """Append long rows to the cumulative CSV (results/all_results.csv), skipping every run id that
+    is already in it, so appending the same results twice changes nothing. Returns (lines added,
+    run ids skipped). A file with other columns is left alone (SweepError): move it aside to start
+    a new one."""
+    existing: set[str] = set()
+    if path.is_file():
+        with open(path, newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames != list(LONG_COLUMNS):
+                raise SweepError(f"{path} has other columns than this sweep writes; move it aside and a new one "
+                                 f"is started")
+            existing = {line["run_id"] for line in reader}
+    new = [line for line in rows if line["run_id"] not in existing]
+    skipped = len({line["run_id"] for line in rows} & existing)
+    if new:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fresh = not path.is_file()
+        with open(path, "a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(LONG_COLUMNS), extrasaction="ignore")
+            if fresh:
+                writer.writeheader()
+            writer.writerows(new)
+    return len(new), skipped
 
 
 def _append_history(path: Path, record: dict[str, Any]) -> None:
@@ -1473,6 +1777,7 @@ def run_sweep(entries: list[PlanEntry], settings: Settings, models: ModelCache,
         (sweep_dir / "status.json").write_text(json.dumps(info, indent=2), encoding="utf-8")
 
     lines: list[dict[str, Any]] = []
+    long: list[dict[str, Any]] = []
     failed: list[str] = []
     outer = WeightedBar(total, len(runnable), label="sweep", unit="rows", show=settings.show_progress, position=0)
     try:
@@ -1489,8 +1794,15 @@ def run_sweep(entries: list[PlanEntry], settings: Settings, models: ModelCache,
                               "arm": entry.row.arm, "model": entry.source.key, "device": entry.row.device})
                 continue
             lines.extend(row_lines)
+            long.extend(record.pop("long"))
             _append_history(settings.history_path, record)
             _write_csv(sweep_dir / "summary.csv", SUMMARY_COLUMNS, lines)   # rewritten after every row
+            _write_csv(sweep_dir / "results_long.csv", LONG_COLUMNS, long)
+            try:
+                append_cumulative(Path(settings.results_dir) / "all_results.csv",
+                                  [line for line in long if line["row"] == entry.row.name])
+            except SweepError as error:
+                write(f"all_results.csv not updated: {error}")
         status(len(runnable), None, failed)
     finally:
         outer.close()
@@ -1499,7 +1811,8 @@ def run_sweep(entries: list[PlanEntry], settings: Settings, models: ModelCache,
     actual = time.perf_counter() - started
     write(f"sweep {sweep_id}: {len(runnable) - len(failed)}/{len(runnable)} rows in {format_seconds(actual)} "
           f"(estimated {format_seconds(total)})" + (f"; failed: {', '.join(failed)}" if failed else ""))
-    write(f"summary: {sweep_dir / 'summary.csv'}")
+    write(f"summary: {sweep_dir / 'summary.csv'}; long format for a spreadsheet: {sweep_dir / 'results_long.csv'}, "
+          f"also appended to {Path(settings.results_dir) / 'all_results.csv'}")
     return sweep_dir, lines, len(failed)
 
 
@@ -1523,9 +1836,12 @@ def parse_args(argv: list[str] | None) -> tuple[argparse.Namespace, Settings]:
     parser.add_argument("--power-warmup-seconds", type=float, default=2.0,
                         help="unsampled run before each power window, so power reaches steady state")
     parser.add_argument("--idle-seconds", type=float, default=3.0, help="idle power sample at the start")
-    parser.add_argument("--max-eval-tokens", type=int, default=None,
-                        help="perplexity reads at most this many tokens per dataset (0: the whole split; "
-                        "default: each dataset's own limit in common/data.py)")
+    parser.add_argument("--max-eval-chars", type=int, default=None,
+                        help="perplexity reads the first this-many characters of each dataset's split, the same "
+                        "text for every model (0: the whole split; default: each dataset's own limit in "
+                        "common/data.py)")
+    parser.add_argument("--allow-gaps", action="store_true",
+                        help="run even if a row doesn't measure every (dataset, benchmark) the lut rows measure")
     parser.add_argument("--seed", type=int, default=0, help="seed for prompts and the core's random weights")
     parser.add_argument("--results-dir", type=Path, default=REPO_ROOT / "results")
     parser.add_argument("--history", type=Path, default=local_cache.LOCAL_DIR / "sweep-history.jsonl",
@@ -1537,13 +1853,13 @@ def parse_args(argv: list[str] | None) -> tuple[argparse.Namespace, Settings]:
     args = parser.parse_args(argv)
     if args.warmup < 0:
         parser.error("--warmup must be 0 or more")
-    if args.max_eval_tokens is not None and args.max_eval_tokens < 0:
-        parser.error("--max-eval-tokens must be 0 or more")
+    if args.max_eval_chars is not None and args.max_eval_chars < 0:
+        parser.error("--max-eval-chars must be 0 or more")
     settings = Settings(csv_path=args.csv, only=[n.strip() for n in args.only.split(",") if n.strip()] if args.only else None,
                         warmup=args.warmup, power=not args.no_power, power_seconds=args.power_seconds,
                         power_warmup_s=args.power_warmup_seconds, idle_seconds=args.idle_seconds, seed=args.seed,
                         download=args.download, calibrate=not args.no_calibrate,
-                        max_eval_tokens=args.max_eval_tokens, results_dir=args.results_dir,
+                        max_eval_chars=args.max_eval_chars, allow_gaps=args.allow_gaps, results_dir=args.results_dir,
                         history_path=args.history, show_progress=args.progress)
     return args, settings
 
@@ -1552,6 +1868,7 @@ def main(argv: list[str] | None = None) -> int:
     args, settings = parse_args(argv)
     precision.full_fp32()            # float32 means full float32: TF32 off before anything runs
     _TOKENS.clear()
+    _TEXTS.clear()
     rows, errors = read_csv(settings.csv_path)
     run_rows, select_errors = select_rows(rows, settings.only)
     errors += select_errors
@@ -1563,6 +1880,16 @@ def main(argv: list[str] | None = None) -> int:
         print("The sweep did not start; nothing ran. Fix these first:", file=sys.stderr)
         for error in errors:
             print(f"  - {error}", file=sys.stderr)
+        return 2
+    coverage = check_coverage(run_rows)                       # after validate filled in the weights
+    if coverage.gaps and not settings.allow_gaps:
+        print(format_coverage(run_rows, coverage), flush=True)
+        print("The sweep did not start; nothing ran. These rows don't measure everything Alpha's model (the lut "
+              "rows) measures, so their results wouldn't line up:", file=sys.stderr)
+        for error in coverage_errors(coverage):
+            print(f"  - {error}", file=sys.stderr)
+        print("Add the missing benchmarks or datasets to those rows (a '# defaults:' line sets them for every "
+              "row with blank cells), or pass --allow-gaps.", file=sys.stderr)
         return 2
 
     for name in datasets_to_download(run_rows):              # only with --download (validate checked)

@@ -236,7 +236,9 @@ def test_tiny_sweep_end_to_end_on_the_cpu(tmp_path, capsys):
     assert "Total ETA" in out
 
     (sweep_dir,) = (results / "sweeps").iterdir()
-    assert sorted(p.name for p in sweep_dir.iterdir()) == ["models.csv", "plan.csv", "status.json", "summary.csv"]
+    assert sorted(p.name for p in sweep_dir.iterdir()) == ["models.csv", "plan.csv", "results_long.csv", "status.json",
+                                                           "summary.csv"]
+    assert (results / "all_results.csv").is_file()
     status = json.loads((sweep_dir / "status.json").read_text())
     assert status["rows_done"] == status["rows_total"] == 2 and status["failed_rows"] == []
     with open(sweep_dir / "summary.csv", newline="") as handle:
@@ -540,15 +542,15 @@ def test_perplexity_in_one_window_equals_the_full_forward_loss():
 
 def test_perplexity_end_to_end_hf_and_baseline_agree_on_gpt2(tmp_path, monkeypatch, capsys):
     """Both arms on GPT-2's weights, on a small local text file (no download), through the sweep:
-    same perplexity to float32 precision, two windows of 1,024 tokens, and the next plan comes
-    from history."""
+    the same text (sha256, bytes, words) for both, the same perplexity and bits per byte to float32
+    precision, two windows of 1,024 tokens, and the next plan comes from history."""
     _gpt2_or_skip()
     folder = tmp_path / "datasets" / "tinytext"
     folder.mkdir(parents=True)
     (folder / "story.txt").write_text(" ".join(f"Sentence {i} is about a small model that reads a story."
                                                for i in range(200)))
     spec = sweep.data.DatasetSpec(name="tinytext", hf_repo="local/none", files={"test": "story.txt"},
-                                  file_format="txt", eval_split="test", about="test text", eval_token_limit=1500)
+                                  file_format="txt", eval_split="test", about="test text", eval_char_limit=6000)
     monkeypatch.setattr(sweep.data, "DATASET_DIR", tmp_path / "datasets")
     monkeypatch.setitem(sweep.data.DATASETS, "tinytext", spec)
     path = _full_csv(tmp_path, "yes,hf_ppl,hf,gpt2,pretrained,,cpu,perplexity,tinytext,,,,,\n"
@@ -561,12 +563,18 @@ def test_perplexity_end_to_end_hf_and_baseline_agree_on_gpt2(tmp_path, monkeypat
         lines = list(csv.DictReader(handle))
     assert [(line["row"], line["benchmark"], line["dataset"]) for line in lines] == \
         [("hf_ppl", "perplexity", "tinytext"), ("base_ppl", "perplexity", "tinytext")]
+    sha = sweep.data.file_sha256(folder / "story.txt")
     for line in lines:
+        # 6,000 characters cut back to a space: 5,993 characters, 1,199 words, 1,417 GPT-2 tokens
         assert (line["eval_windows"], line["eval_tokens"], line["eval_window"], line["eval_stride"]) == \
-            ("2", "1499", "1024", "512")
+            ("2", "1416", "1024", "512")
+        assert (line["eval_chars"], line["eval_bytes"], line["eval_words"], line["dataset_sha256"]) == \
+            ("5993", "5993", "1199", sha)
         assert line["weights"] == "pretrained"
     hf, ours = (float(line["perplexity"]) for line in lines)
     assert ours == pytest.approx(hf, rel=1e-4)
+    hf_bpb, our_bpb = (float(line["bits_per_byte"]) for line in lines)
+    assert our_bpb == pytest.approx(hf_bpb, rel=1e-4) and 0 < hf_bpb < 2
     assert 1.0 < hf < 50.0                                       # repetitive text: low perplexity
 
     capsys.readouterr()

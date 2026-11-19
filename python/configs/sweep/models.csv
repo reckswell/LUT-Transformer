@@ -9,6 +9,9 @@
 #   benchmarks  speed (latency, tokens/s, power on synthetic tokens) and/or perplexity (on each dataset)
 #   datasets    wikitext2, tinystories (common/data.py); used by perplexity, ignored by speed
 #   batch, context_lengths, decode_tokens, repeats: speed only
+# Every row must measure what the lut rows (Alpha's model) measure; the plan shows a coverage matrix and a gap
+# stops the sweep (--allow-gaps runs it anyway). One line of the form 'defaults: benchmarks=... datasets=...'
+# after a # sets both for every row whose cells are blank (random-weight rows take the speed part only).
 # Models load only from ../LUT-Transformer-local/checkpoints. Installed: gpt2 (openai-community/gpt2, 124M) and
 # stories15m (Xenova/llama2.c-stories15M: Karpathy's 15.2M-parameter Llama trained on TinyStories). Every arm runs
 # both (our arms through the GPT-2 and Llama profiles in reference/).
