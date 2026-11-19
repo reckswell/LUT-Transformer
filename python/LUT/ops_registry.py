@@ -1,6 +1,8 @@
-"""Turn the LUT host's toggles into the functions the model calls.
+"""Turn the LUT host's toggles (its PARAMETERS block, or a named preset) into the functions its
+wiring calls.
 
-Start from every stage on its baseline function (baseline/host.py:base_ops), then, for each stage
+Start from every stage on its baseline function (baseline/host.py:base_ops, the same building
+blocks the baseline model uses), then, for each stage
 the toggles give a LUT architecture, swap in the same-named function from inference_lut.py (or the
 <name>_forward / <name>_backward pair from train_lut.py in training), with the architecture bound
 to it, in the layers the toggle names. Everything is checked here, at start-up, so a typo in the
@@ -16,7 +18,7 @@ from baseline import host as base
 from LUT import inference_lut, train_lut
 
 if TYPE_CHECKING:
-    from LUT.host import Stage
+    from LUT.stages import Stage
 
 
 def check_toggles(toggles: dict[str, "Stage"], cfg: base.TransformerConfig) -> None:
@@ -46,7 +48,8 @@ def lut_function(stage: str, choice: "Stage", cfg: base.TransformerConfig, mode:
 
 
 def resolve_ops(toggles: dict[str, "Stage"], cfg: base.TransformerConfig, mode: base.Mode) -> base.ModelOps:
-    """ModelOps for baseline/host.py's composition, with each toggled stage swapped in."""
+    """ModelOps for LUT/host.py's wiring: every stage on its baseline function, then each toggled
+    stage swapped in. Stages are independent; nothing here overrides a toggle."""
     check_toggles(toggles, cfg)
     ops = base.base_ops(cfg, mode)
     for stage, choice in toggles.items():
@@ -65,16 +68,22 @@ def resolve_ops(toggles: dict[str, "Stage"], cfg: base.TransformerConfig, mode: 
 
 def describe(toggles: dict[str, "Stage"], cfg: base.TransformerConfig) -> list[dict[str, str]]:
     """One row per stage (stages the toggles leave out run the baseline), for printing and for
-    run metadata: what runs, the table shape and size, the layers, and the input quantization."""
+    run metadata: what runs, the table shape and size, the layers, and the input quantization.
+    A stage the model doesn't have (rope without rotary positions, ffn_gate without a gated
+    feed-forward) says "not in this model"."""
     rows = []
     for stage in base.STAGES:
         choice = toggles.get(stage)
         lut = choice.lut if choice else None
         quant = choice.quant if choice else None
         layers = choice.layers if choice and choice.layers is not None else None
+        if not base.stage_used(stage, cfg):
+            runs = "not in this model"       # e.g. rope without rotary positions; the toggle does nothing
+        else:
+            runs = f"lut:{lut.name}" if lut else f"base:{base.function_name(stage, cfg)}"
         rows.append({
             "stage": stage,
-            "runs": f"lut:{lut.name}" if lut else f"base:{base.function_name(stage, cfg)}",
+            "runs": runs,
             "shape": f"{lut.inputs_per_table} x {lut.bits_per_input} -> {lut.out_bits}" if lut else "-",
             "table_bits": f"{lut.table_bits():,}" if lut else "-",
             "layers": ("-" if stage not in base.LAYER_STAGES

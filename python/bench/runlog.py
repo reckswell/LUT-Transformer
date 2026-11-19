@@ -84,6 +84,11 @@ def _torch_info() -> dict[str, Any]:
         "cuda_build": torch.version.cuda,
         "cuda_available": torch.cuda.is_available(),
         "num_threads": torch.get_num_threads(),
+        # How float32 math runs (common/precision.py): full float32 unless TF32 is allowed.
+        "default_dtype": str(torch.get_default_dtype()),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
     }
     if torch.cuda.is_available():
         info["cudnn"] = torch.backends.cudnn.version()
@@ -171,8 +176,11 @@ class Run:
         with open(self.dir / "metrics.jsonl", "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, default=_jsonable) + "\n")
 
-    def save_power(self, report: dict[str, Any]) -> None:
-        """Save a PowerMonitor.stop() report. Raw samples go to a separate, gitignored file."""
+    def save_power(self, report: dict[str, Any], window: str | None = None) -> None:
+        """Save a PowerMonitor.stop() report as power.json. Raw samples go to a separate, gitignored
+        file (power_samples.json). A run with several power windows names each one: window
+        "decode_T512" writes power_decode_T512.json and power_samples_decode_T512.json."""
+        suffix = f"_{window}" if window else ""
         samples = {
             source: data.get("samples", [])
             for source, data in report.get("sources", {}).items()
@@ -180,9 +188,9 @@ class Run:
         trimmed = json.loads(json.dumps(report, default=_jsonable))
         for data in trimmed.get("sources", {}).values():
             data.pop("samples", None)
-        self._write_json("power.json", trimmed)
+        self._write_json(f"power{suffix}.json", trimmed)
         if any(samples.values()):
-            self._write_json("power_samples.json", samples)
+            self._write_json(f"power_samples{suffix}.json", samples)
 
     def finish(self, summary: dict[str, Any]) -> Path:
         """Write summary.json and append a row to results/summary.csv. Returns the run directory."""

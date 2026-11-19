@@ -1,0 +1,23 @@
+# Profile: stories15M, Karpathy's 15.2M-parameter Llama trained on TinyStories (llama2.c), pretrained
+# weights in Hugging Face's format (Xenova/llama2.c-stories15M, installed in ../LUT-Transformer-local).
+# The core plus the components Llama switches on: RMSNorm with eps 1e-5, SwiGLU (SiLU in a gated
+# feed-forward) and rotary positions. The weights load through reference/hf_llama.py; the ground
+# truth is transformers' LlamaForCausalLM, not reference/torch_model.py.
+name: stories15m
+vocab_size: 32000             # SentencePiece (Llama 2's tokenizer)
+context_length: 256           # the context it was trained with; rotary positions have no hard limit
+d_model: 288
+n_heads: 6                    # head width 48; no grouped-query attention
+n_layers: 6
+d_ff: 768
+
+norm: rmsnorm
+norm_eps: 1.0e-5
+norm_placement: pre
+activation: silu
+ffn: glu                      # silu(W1 h) * (W3 h), then W2: SwiGLU
+positional_encoding: rope
+rope_theta: 10000.0
+tie_embeddings: true          # the output layer is the token table
+bias: false
+dropout: 0.0

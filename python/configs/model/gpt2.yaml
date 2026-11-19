@@ -1,0 +1,19 @@
+# Profile: GPT-2 small (124M), pretrained weights from Hugging Face (openai-community/gpt2).
+# The core plus the components GPT-2 switches on: LayerNorm, GELU (tanh form), learned positions
+# (1,024 of them) and biases everywhere. The weights load through reference/hf_gpt2.py; the
+# ground truth is transformers' GPT2LMHeadModel, not reference/torch_model.py.
+name: gpt2
+vocab_size: 50257
+context_length: 1024
+d_model: 768
+n_heads: 12                   # head width 64
+n_layers: 12
+d_ff: 3072
+
+norm: layernorm               # eps 1e-5, as GPT-2
+norm_placement: pre
+activation: gelu              # GPT-2's tanh approximation
+positional_encoding: learned
+tie_embeddings: true
+bias: true
+dropout: 0.0
