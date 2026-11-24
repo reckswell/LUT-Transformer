@@ -77,6 +77,10 @@ def learned_positions(length: int, table: Tensor, start: int = 0) -> Tensor:
     return table[start:start + length]
 
 
+# rope_tables' built tables: (device, dtype, head_dim, theta) -> (cos, sin), each (rows, Dh/2)
+_ROPE_TABLES: dict[tuple, tuple[Tensor, Tensor]] = {}
+
+
 def rope_tables(length: int, head_dim: int, theta: float = 10000.0, start: int = 0, *, device=None,
                 dtype=torch.float32) -> tuple[Tensor, Tensor]:
     """Rotary position tables (cos, sin) for positions start .. start+length-1, each (length, Dh/2).
@@ -96,14 +100,37 @@ def rope_tables(length: int, head_dim: int, theta: float = 10000.0, start: int =
     checkpoint was trained and is served with. (A float64-built table would differ by up to about
     2e-5 at position 255, because p * w is rounded to float32 there; sinusoidal_positions is built
     in float64 instead because it has no reference implementation to match.)
+
+    Built once, then sliced (2026-11-24): the table for positions 0 .. N-1 is built the first time a
+    (device, dtype, head_dim, theta) is asked for, with N the next power of two that covers
+    start + length (at least 256), kept in _ROPE_TABLES, and rebuilt larger only when a later call
+    reaches past it. Each call returns rows start .. start+length-1 of it. Like a ROM, the constants
+    sit on the device: before this, every call rebuilt w on the CPU and copied it to the GPU, one
+    host-to-device copy per decode step. The slices are bit for bit the per-call tables, because
+    every element is the same float32 product p * w_i put through the same cos and sin
+    (tests/test_llama_ops.py compares them for positions 0 .. 1023 on the CPU and the GPU).
+    Callers only read the returned slices; clear_rope_tables() empties the cache (for tests).
     """
     if head_dim % 2:
         raise ValueError(f"rotary positions need an even head width, got {head_dim}")
-    # w_i for i = 0 .. Dh/2 - 1: the even column indices 0, 2, 4, ... divided by Dh, as a power of theta.
-    w = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))      # (Dh/2,)
-    p = torch.arange(start, start + length, dtype=torch.float32, device=device)              # (length,)
-    angle = p[:, None] * w.to(device)[None, :]                    # (length, Dh/2), angle[p, i] = p * w_i
-    return torch.cos(angle).to(dtype), torch.sin(angle).to(dtype)
+    need = start + length
+    key = (str(torch.device(device)) if device is not None else "cpu", dtype, head_dim, float(theta))
+    cached = _ROPE_TABLES.get(key)
+    if cached is None or cached[0].shape[0] < need:
+        rows = max(256, 1 << max(need - 1, 0).bit_length())       # positions 0 .. rows-1
+        # w_i for i = 0 .. Dh/2 - 1: the even column indices 0, 2, 4, ... divided by Dh, as a power of theta.
+        w = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))  # (Dh/2,), on the CPU
+        p = torch.arange(0, rows, dtype=torch.float32, device=device)                        # (rows,)
+        angle = p[:, None] * w.to(device)[None, :]                # (rows, Dh/2), angle[p, i] = p * w_i
+        cached = (torch.cos(angle).to(dtype), torch.sin(angle).to(dtype))
+        _ROPE_TABLES[key] = cached
+    cos, sin = cached
+    return cos[start:need], sin[start:need]
+
+
+def clear_rope_tables() -> None:
+    """Forget every cached rotary table (rope_tables builds them again on the next call)."""
+    _ROPE_TABLES.clear()
 
 
 def rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
