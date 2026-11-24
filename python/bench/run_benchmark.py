@@ -40,11 +40,25 @@ def _matmul_workload(device: str, size: int, dtype_name: str) -> tuple[Callable[
 
 
 def _power_window(
-    fn: Callable[[], Any], device: str, target: str, seconds: float
-) -> tuple[dict[str, Any], int]:
-    """Call fn() back to back for at least `seconds` while sampling power. Returns (report, calls)."""
+    fn: Callable[[], Any], device: str, target: str, seconds: float, warmup_s: float = 2.0,
+    settle_tolerance: float = 0.03, max_warmup_s: float = 10.0,
+) -> tuple[dict[str, Any], int, dict[str, Any]]:
+    """Warm up, then call fn() back to back for at least `seconds` while sampling power.
+    Returns (report, calls, warm-up record).
+
+    The warm-up runs fn() unsampled for at least warmup_s seconds and, on a GPU, until three power
+    readings in a row agree within settle_tolerance (at most max_warmup_s): bench/resources.py
+    warm_up_until_steady. Without it the window started cold: GPU power climbed from 57 W to 330 W
+    over the first 0.8 s and the reported average (329.5 W) was 8.6% below the steady 360.3 W (run
+    20261119T060430Z_matmul_cuda_4096_float32, agent/STATE.md Next item 6). nvidia-smi's power.draw
+    is itself a ~1 s average, which adds to the lag."""
+    from bench.resources import warm_up_until_steady
     from bench.timing import _synchronize
 
+    warm = warm_up_until_steady(fn, lambda: _synchronize(device), min_s=warmup_s, device=device,
+                                tolerance=settle_tolerance, max_s=max_warmup_s) if warmup_s > 0 else \
+        {"warmup_s": 0.0, "warmup_calls": 0, "settled": False, "readings_w": [], "tolerance": settle_tolerance,
+         "min_s": 0.0, "max_s": max_warmup_s}
     monitor = PowerMonitor(target=target, enabled=True, note=f"workload on {device}")
     monitor.start()
     calls = 0
@@ -55,7 +69,7 @@ def _power_window(
         if calls % 8 == 0:
             _synchronize(device)
     _synchronize(device)
-    return monitor.stop(), calls
+    return monitor.stop(), calls, warm
 
 
 def _idle_power(target: str, seconds: float) -> dict[str, Any]:
@@ -81,6 +95,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--power", action="store_true", help="also measure power and energy")
     parser.add_argument("--power-seconds", type=float, default=10.0, help="length of the power window")
+    parser.add_argument("--power-warmup-seconds", type=float, default=2.0,
+                        help="unsampled run before the power window, at least this long (0: none)")
+    parser.add_argument("--power-settle-tolerance", type=float, default=0.03,
+                        help="keep warming up until 3 power readings agree within this fraction (0: fixed warm-up)")
+    parser.add_argument("--power-max-warmup-seconds", type=float, default=10.0, help="upper bound on the warm-up")
     parser.add_argument(
         "--power-target",
         choices=["cpu", "cuda", "xrt", "all"],
@@ -126,9 +145,14 @@ def main(argv: list[str] | None = None) -> None:
     run.log(kind="timing", **stats.to_dict(include_samples=True))
 
     if args.power:
-        report, calls = _power_window(fn, args.device, target, args.power_seconds)
+        report, calls, warm = _power_window(fn, args.device, target, args.power_seconds, args.power_warmup_seconds,
+                                            args.power_settle_tolerance, args.power_max_warmup_seconds)
         run.save_power(report)
+        run.log(kind="power_warmup", **warm)
         summary["power_window_calls"] = calls
+        summary["power_warmup_s"] = warm["warmup_s"]
+        summary["power_warmup_calls"] = warm["warmup_calls"]
+        summary["power_warmup_settled"] = warm["settled"]
         for source, data in report.get("sources", {}).items():
             if data.get("energy_joules") is not None:
                 summary[f"avg_power_w.{source}"] = data["average_power_watts"]

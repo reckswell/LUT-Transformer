@@ -174,3 +174,40 @@ def test_swiglu_feed_forward_chain_matches_autograd(gen):
     dh1, dw1, _ = train.linear_backward(train.silu_backward(dz, c_act), c_up)
     for mine, theirs in ((dh1 + dh3, h.grad), (dw1, w1.grad), (dw2, w2.grad), (dw3, w3.grad)):
         torch.testing.assert_close(mine, theirs, **TIGHT)
+
+
+def _rope_tables_per_call(length, head_dim, theta=10000.0, start=0, *, device=None, dtype=torch.float32):
+    """rope_tables as it was before 2026-11-24 (rebuilt on every call, w copied from the CPU each
+    time): the reference the cached table must equal bit for bit."""
+    w = 1.0 / (theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    p = torch.arange(start, start + length, dtype=torch.float32, device=device)
+    angle = p[:, None] * w.to(device)[None, :]
+    return torch.cos(angle).to(dtype), torch.sin(angle).to(dtype)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="no CUDA device"))])
+@pytest.mark.parametrize("dtype", [torch.float32, D64])
+def test_cached_rope_tables_equal_the_per_call_tables_bit_for_bit(device, dtype):
+    inference.clear_rope_tables()
+    for length in (1, 2, 7, 64, 256):
+        for start in range(0, 1024 - length + 1, 1 if length == 1 else 37):
+            cos, sin = inference.rope_tables(length, 48, 10000.0, start, device=device, dtype=dtype)
+            ref_cos, ref_sin = _rope_tables_per_call(length, 48, 10000.0, start, device=device, dtype=dtype)
+            assert torch.equal(cos, ref_cos) and torch.equal(sin, ref_sin), (length, start)
+            assert cos.device.type == device and cos.dtype == dtype
+
+
+def test_the_rope_table_is_built_once_and_grows_when_needed():
+    inference.clear_rope_tables()
+    a, _ = inference.rope_tables(1, 8, start=5)
+    b, _ = inference.rope_tables(1, 8, start=200)
+    assert a.untyped_storage().data_ptr() == b.untyped_storage().data_ptr()        # one 256-row table, sliced
+    assert len(inference._ROPE_TABLES) == 1 and next(iter(inference._ROPE_TABLES.values()))[0].shape == (256, 4)
+    c, _ = inference.rope_tables(4, 8, start=300)                                     # past row 255: rebuilt larger
+    assert next(iter(inference._ROPE_TABLES.values()))[0].shape == (512, 4)
+    assert torch.equal(c, _rope_tables_per_call(4, 8, start=300)[0])
+    inference.rope_tables(1, 8, dtype=D64)                                            # another dtype: its own table
+    assert len(inference._ROPE_TABLES) == 2
+    inference.clear_rope_tables()
+    assert not inference._ROPE_TABLES
