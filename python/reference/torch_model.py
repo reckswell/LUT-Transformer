@@ -10,7 +10,9 @@ Two jobs:
      cost of the from-scratch and LUT versions is measured against a fair reference.
 
 It mirrors TransformerConfig exactly (norm type, eps and placement, activation, plain or gated
-feed-forward, positional encoding including rotary, tied embeddings, bias) and uses the same
+feed-forward, positional encoding including rotary, tied embeddings, bias, and the options for
+other families: grouped-query attention, head width, separate biases, parallel blocks, partial
+rotary, exact GELU, embedding scale, output-layer bias) and uses the same
 parameter names as host.init_params, so copy_params_*
 can move weights between the two. It deliberately shares no code with baseline/inference.py:
 everything here comes from torch.nn, torch.nn.functional and torch's own kernels, so a mistake
@@ -66,38 +68,58 @@ def _rotate_half(x: Tensor) -> Tensor:
 
 class Attention(nn.Module):
     """Multi-head causal self-attention from four nn.Linear layers and torch's fused
-    scaled_dot_product_attention kernel, with rotary positions on q and k if the config asks."""
+    scaled_dot_product_attention kernel, with rotary positions on q and k if the config asks
+    (on the first rotary_dim columns of each head when that is set). With grouped-query attention
+    the key/value heads are repeated with repeat_interleave before the kernel."""
 
     def __init__(self, cfg: Any) -> None:
         super().__init__()
-        self.n_heads = cfg.n_heads
+        self.n_heads, self.n_kv, self.dh = cfg.n_heads, cfg.kv_heads, cfg.head_dim
         self.rope_theta = cfg.rope_theta if cfg.positional_encoding == "rope" else None
-        self.wq = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
-        self.wk = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
-        self.wv = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
-        self.wo = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
+        self.rotary = cfg.rotary_columns
+        self.window = cfg.attention_window
+        qkv_bias, out_bias = cfg.has_bias("qkv"), cfg.has_bias("out")
+        self.wq = nn.Linear(cfg.d_model, self.n_heads * self.dh, bias=qkv_bias)
+        self.wk = nn.Linear(cfg.d_model, self.n_kv * self.dh, bias=qkv_bias)
+        self.wv = nn.Linear(cfg.d_model, self.n_kv * self.dh, bias=qkv_bias)
+        self.wo = nn.Linear(self.n_heads * self.dh, cfg.d_model, bias=out_bias)
+
+    def _rotary(self, z: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        r = self.rotary
+        rotated = z[..., :r] * cos + _rotate_half(z[..., :r]) * sin
+        return rotated if r == z.shape[-1] else torch.cat((rotated, z[..., r:]), dim=-1)
 
     def forward(self, x: Tensor) -> Tensor:
-        b, t, d = x.shape
-        q, k, v = (proj(x).view(b, t, self.n_heads, d // self.n_heads).transpose(1, 2)
-                   for proj in (self.wq, self.wk, self.wv))
+        b, t, _ = x.shape
+        q = self.wq(x).view(b, t, self.n_heads, self.dh).transpose(1, 2)
+        k, v = (proj(x).view(b, t, self.n_kv, self.dh).transpose(1, 2) for proj in (self.wk, self.wv))
         if self.rope_theta is not None:
-            cos, sin = _rotary_cos_sin(t, d // self.n_heads, self.rope_theta, q)
-            q, k = q * cos + _rotate_half(q) * sin, k * cos + _rotate_half(k) * sin
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        return self.wo(out.transpose(1, 2).reshape(b, t, d))
+            cos, sin = _rotary_cos_sin(t, self.rotary, self.rope_theta, q)
+            q, k = self._rotary(q, cos, sin), self._rotary(k, cos, sin)
+        if self.n_kv != self.n_heads:
+            k = k.repeat_interleave(self.n_heads // self.n_kv, dim=1)
+            v = v.repeat_interleave(self.n_heads // self.n_kv, dim=1)
+        if self.window is None:
+            out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:                                            # sliding window: keys j with i - window < j <= i
+            pos = torch.arange(t, device=x.device)
+            gap = pos[:, None] - pos[None, :]
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=(gap >= 0) & (gap < self.window))
+        return self.wo(out.transpose(1, 2).reshape(b, t, self.n_heads * self.dh))
 
 
 class FeedForward(nn.Module):
-    """w2(act(w1(x))) from nn.Linear layers and nn.ReLU, nn.GELU (tanh approximation) or nn.SiLU.
-    Gated (cfg.ffn = glu): w2(act(w1(x)) * w3(x)), which with SiLU is Llama's SwiGLU."""
+    """w2(act(w1(x))) from nn.Linear layers and nn.ReLU, nn.GELU (tanh approximation or exact)
+    or nn.SiLU. Gated (cfg.ffn = glu): w2(act(w1(x)) * w3(x)), which with SiLU is Llama's SwiGLU."""
 
     def __init__(self, cfg: Any) -> None:
         super().__init__()
-        self.w1 = nn.Linear(cfg.d_model, cfg.d_ff, bias=cfg.bias)
-        self.w2 = nn.Linear(cfg.d_ff, cfg.d_model, bias=cfg.bias)
-        self.w3 = nn.Linear(cfg.d_model, cfg.d_ff, bias=cfg.bias) if cfg.ffn == "glu" else None
-        self.act = {"gelu": nn.GELU(approximate="tanh"), "silu": nn.SiLU()}.get(cfg.activation, nn.ReLU())
+        bias = cfg.has_bias("ffn")
+        self.w1 = nn.Linear(cfg.d_model, cfg.d_ff, bias=bias)
+        self.w2 = nn.Linear(cfg.d_ff, cfg.d_model, bias=bias)
+        self.w3 = nn.Linear(cfg.d_model, cfg.d_ff, bias=bias) if cfg.ffn == "glu" else None
+        self.act = {"relu": nn.ReLU(), "gelu": nn.GELU(approximate="tanh"), "gelu_exact": nn.GELU(),
+                    "silu": nn.SiLU()}[cfg.activation]
 
     def forward(self, x: Tensor) -> Tensor:
         if self.w3 is None:
@@ -107,15 +129,22 @@ class FeedForward(nn.Module):
 
 class Block(nn.Module):
     """One decoder layer: attention and feed-forward, each with a residual connection, and a norm
-    before (pre-norm) or after (post-norm) each residual branch."""
+    before (pre-norm) or after (post-norm) each residual branch. A parallel block adds both
+    branches, read from the same residual, at once."""
 
     def __init__(self, cfg: Any) -> None:
         super().__init__()
         self.pre_norm = cfg.norm_placement == "pre"
+        self.parallel = cfg.block != "sequential"
         self.norm1, self.attn = _norm(cfg), Attention(cfg)
-        self.norm2, self.ffn = _norm(cfg), FeedForward(cfg)
+        # parallel_shared_norm: one norm feeds both branches, so there is no norm2.
+        self.norm2 = None if cfg.block == "parallel_shared_norm" else _norm(cfg)
+        self.ffn = FeedForward(cfg)
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.parallel:
+            h = self.norm1(x)
+            return self.attn(h) + self.ffn(h if self.norm2 is None else self.norm2(x)) + x
         if self.pre_norm:
             x = x + self.attn(self.norm1(x))
             return x + self.ffn(self.norm2(x))
@@ -139,12 +168,16 @@ class ReferenceTransformer(nn.Module):
             self.register_buffer("pos_table", _sinusoidal_table(cfg.context_length, cfg.d_model), persistent=False)
         self.layers = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layers))
         self.norm_f = _norm(cfg)
-        self.lm_head = None if cfg.tie_embeddings else nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+        self.lm_head = None if cfg.tie_embeddings else nn.Linear(cfg.d_model, cfg.vocab_size, bias=cfg.lm_head_bias)
+        # Tied output layer with a bias: the bias is the only output-layer parameter of its own.
+        self.tied_bias = nn.Parameter(torch.zeros(cfg.vocab_size)) if cfg.tie_embeddings and cfg.lm_head_bias else None
 
     def forward(self, token_ids: Tensor) -> Tensor:
         """token_ids (B, T) -> logits (B, T, V)."""
         t = token_ids.shape[1]
         x = self.tok_emb(token_ids)
+        if self.cfg.embed_scale is not None:
+            x = x * torch.tensor(self.cfg.embed_scale, dtype=x.dtype)
         if self.cfg.positional_encoding == "learned":
             x = x + self.pos_emb(torch.arange(t, device=token_ids.device))
         elif self.cfg.positional_encoding == "sinusoidal":
@@ -155,7 +188,7 @@ class ReferenceTransformer(nn.Module):
             x = block(x)
         x = self.norm_f(x)
         if self.lm_head is None:
-            return F.linear(x, self.tok_emb.weight)         # tied: logits = x @ tok_emb^T
+            return F.linear(x, self.tok_emb.weight, self.tied_bias)   # tied: logits = x @ tok_emb^T (+ b)
         return self.lm_head(x)
 
     def scratch_params(self) -> dict[str, nn.Parameter]:
@@ -172,7 +205,8 @@ class ReferenceTransformer(nn.Module):
                 named[f"{p}.attn.{name}"] = linear.weight
                 if linear.bias is not None:
                     named[f"{p}.attn.b{name[1]}"] = linear.bias
-            named.update(_norm_params(f"{p}.norm2", block.norm2))
+            if block.norm2 is not None:
+                named.update(_norm_params(f"{p}.norm2", block.norm2))
             for name in ("w1", "w2", "w3"):
                 linear = getattr(block.ffn, name)
                 if linear is None:                       # w3 only in a gated feed-forward
@@ -183,6 +217,10 @@ class ReferenceTransformer(nn.Module):
         named.update(_norm_params("norm_f", self.norm_f))
         if self.lm_head is not None:
             named["lm_head"] = self.lm_head.weight
+            if self.lm_head.bias is not None:
+                named["lm_head_bias"] = self.lm_head.bias
+        if self.tied_bias is not None:
+            named["lm_head_bias"] = self.tied_bias
         return named
 
 

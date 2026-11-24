@@ -117,7 +117,7 @@ def test_both_hosts_print_info_for_the_profile(capsys):
     assert "(not used by this model)" in capsys.readouterr().out          # GPT-2 has no rope or gate
 
 
-def test_loader_rejects_settings_we_do_not_model():
+def test_loader_maps_the_newer_llama_options_and_rejects_settings_we_do_not_model():
     def config(**changes):
         base = dict(hidden_act="silu", num_attention_heads=4, num_key_value_heads=4, hidden_size=32,
                     rope_parameters={"rope_type": "default", "rope_theta": 10000.0}, attention_bias=False,
@@ -125,14 +125,22 @@ def test_loader_rejects_settings_we_do_not_model():
                     intermediate_size=48, rms_norm_eps=1e-5, tie_word_embeddings=True)
         return SimpleNamespace(**{**base, **changes})
 
-    assert hf_llama.llama_config_from_hf(config()).positional_encoding == "rope"
-    for changes, message in ((dict(num_key_value_heads=2), "grouped-query"),
-                             (dict(hidden_act="gelu"), "not silu"),
-                             (dict(rope_parameters={"rope_type": "linear", "rope_theta": 1e4, "factor": 2.0}), "rotary variant"),
-                             (dict(attention_bias=True), "biases"),
-                             (dict(head_dim=16), "head_dim")):
+    plain = hf_llama.llama_config_from_hf(config())
+    assert plain.positional_encoding == "rope" and plain.n_kv_heads is None and plain.head_size is None
+    # Grouped-query attention, wider heads and biases map onto their TransformerConfig options
+    # (reference/hf_families.py; checked against Hugging Face in tests/test_hf_families.py).
+    assert hf_llama.llama_config_from_hf(config(num_key_value_heads=2)).kv_heads == 2
+    assert hf_llama.llama_config_from_hf(config(head_dim=16)).head_dim == 16
+    biased = hf_llama.llama_config_from_hf(config(attention_bias=True, mlp_bias=True))
+    assert biased.has_bias("qkv") and biased.has_bias("out") and biased.has_bias("ffn")
+    for changes, message in ((dict(hidden_act="quick_gelu"), "activation 'quick_gelu'"),
+                             (dict(rope_parameters={"rope_type": "linear", "rope_theta": 1e4, "factor": 2.0}), "rotary variant")):
         with pytest.raises(ValueError, match=message):
             hf_llama.llama_config_from_hf(config(**changes))
+    # Every problem is listed, not only the first.
+    with pytest.raises(ValueError, match="2 setting") as err:
+        hf_llama.llama_config_from_hf(config(hidden_act="quick_gelu", rope_parameters={"rope_type": "llama3", "rope_theta": 5e5}))
+    assert len(err.value.problems) == 2
     # Older configs keep rope_theta and rope_scaling at the top level.
     older = config(rope_parameters=None, rope_theta=500.0, rope_scaling=None)
     assert hf_llama.llama_config_from_hf(older).rope_theta == 500.0

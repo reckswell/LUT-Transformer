@@ -44,6 +44,29 @@ VARIANTS = {
     # feed-forward matrices (b3), rotary positions with post-norm, untied output layer.
     "glu_rope_post_norm": dict(norm="layernorm", norm_placement="post", activation="gelu", ffn="glu",
                                positional_encoding="rope", rope_theta=500.0, tie_embeddings=False, bias=True),
+    # Options for other families (reference/hf_families.py). Qwen2-like: grouped-query attention
+    # (2 key/value heads for 4 query heads), biases on Q/K/V only, and an output-layer bias.
+    "gqa_qkv_bias": dict(norm="rmsnorm", norm_placement="pre", activation="silu", ffn="glu",
+                         positional_encoding="rope", tie_embeddings=False, bias=False, n_kv_heads=2,
+                         qkv_bias=True, lm_head_bias=True),
+    # Gemma-like: one key/value head (multi-query), heads wider than d_model / n_heads, embedding
+    # scale sqrt(d_model), tied output layer.
+    "mqa_wide_heads": dict(norm="rmsnorm", norm_placement="pre", activation="gelu", ffn="glu",
+                           positional_encoding="rope", tie_embeddings=True, bias=False, n_kv_heads=1,
+                           head_size=16, embed_scale=32 ** 0.5),
+    # GPT-NeoX-like: parallel block, half of each head rotated, exact GELU, biases everywhere.
+    "parallel_partial_rotary": dict(norm="layernorm", norm_placement="pre", activation="gelu_exact",
+                                    positional_encoding="rope", rotary_dim=4, block="parallel",
+                                    tie_embeddings=False, bias=True),
+    # Phi-like, tied (to cover a bias on a tied output layer): one norm shared by both branches,
+    # partial rotary, no bias on the attention output.
+    "shared_norm_tied_head_bias": dict(norm="layernorm", norm_placement="pre", activation="gelu",
+                                       positional_encoding="rope", rotary_dim=2, block="parallel_shared_norm",
+                                       tie_embeddings=True, lm_head_bias=True, bias=True, out_bias=False),
+    # Mistral-like: sliding-window attention (8 of the 24 positions) with grouped-query attention.
+    "sliding_window": dict(norm="rmsnorm", norm_placement="pre", activation="silu", ffn="glu",
+                           positional_encoding="rope", tie_embeddings=False, bias=False, n_kv_heads=2,
+                           attention_window=8),
 }
 TIGHT = dict(rtol=1e-9, atol=1e-9)
 
@@ -60,7 +83,7 @@ def _setup(variant: str, dtype=torch.float64, seed: int = 0):
     for name, tensor in params.items():
         if name.endswith(".gamma"):
             tensor.copy_(1 + 0.2 * torch.randn(tensor.shape, generator=gen, dtype=dtype))
-        elif name.endswith(".beta") or ".b" in name:
+        elif name.endswith(".beta") or ".b" in name or name == "lm_head_bias":
             tensor.copy_(0.1 * torch.randn(tensor.shape, generator=gen, dtype=dtype))
     model = ref.ReferenceTransformer(cfg).to(dtype)
     ref.copy_params_from_scratch(model, params)

@@ -11,7 +11,8 @@ Profiles so far: stories15M, Karpathy's 15.2M-parameter Llama trained on TinySto
 Hugging Face format published as Xenova/llama2.c-stories15M (pinned revision below; installed in
 ../LUT-Transformer-local/checkpoints, verified bit for bit against Karpathy's stories15M.pt).
 Other Llama-architecture checkpoints load the same way if they use only what we model (see
-llama_config_from_hf).
+llama_config_from_hf); the config and weight mapping live in reference/hf_families.py with the
+other families'.
 
 Rotary convention, which the weights depend on:
   - Meta's original code and llama2.c rotate adjacent column pairs (2i, 2i+1) of each head.
@@ -39,6 +40,7 @@ from torch import Tensor
 
 from baseline import host
 
+from reference import hf_families
 from reference.local_cache import CHECKPOINT_DIR, use_local_hf_cache
 
 STORIES15M = "Xenova/llama2.c-stories15M"
@@ -49,62 +51,18 @@ STORIES15M_REVISION = "17c2f1eabe1e163acc15ad35e225794e7b907682"   # installed 2
 # Config
 # ----------------------------------------------------------------------------------------------
 
-def _rope_settings(hf_config: Any) -> tuple[str, float]:
-    """(rope_type, theta) from a LlamaConfig: transformers 5 keeps them in config.rope_parameters;
-    older configs have rope_theta and rope_scaling (None for plain RoPE)."""
-    parameters = getattr(hf_config, "rope_parameters", None)
-    if parameters:
-        return parameters.get("rope_type", "default"), float(parameters["rope_theta"])
-    scaling = getattr(hf_config, "rope_scaling", None)
-    kind = "default" if not scaling else scaling.get("rope_type", scaling.get("type", "?"))
-    return kind, float(getattr(hf_config, "rope_theta", 10000.0))
-
-
 def llama_config_from_hf(hf_config: Any, name: str = "llama") -> host.TransformerConfig:
-    """Our TransformerConfig for a Hugging Face LlamaConfig.
+    """Our TransformerConfig for a Hugging Face LlamaConfig (reference/hf_families.py's llama profile).
 
     Llama is the core plus RMSNorm with the checkpoint's eps (1e-5 for stories15M), SwiGLU (SiLU in
-    a gated feed-forward), rotary positions (theta from the config), no biases, and tied or untied
-    embeddings as the checkpoint says (stories15M ties them), with pre-norm placement.
-    Raises if the checkpoint uses something our functions don't model, rather than running it
-    wrongly: grouped-query attention (fewer key/value heads than query heads), scaled rotary
-    variants (rope_type other than default), attention or MLP biases, a head width that isn't
-    d_model / n_heads, or an activation other than SiLU.
+    a gated feed-forward), rotary positions (theta from the config), and tied or untied embeddings
+    as the checkpoint says (stories15M ties them), with pre-norm placement. Grouped-query attention
+    (Llama 2 70B, Llama 3, TinyLlama), a head width other than d_model / n_heads and attention or
+    MLP biases map onto their TransformerConfig options. Raises hf_families.Unsupported, listing
+    every setting it can't model, rather than running it wrongly: scaled rotary variants (rope_type
+    other than default, such as Llama 3.1's "llama3"), or an activation we don't have.
     """
-    if hf_config.hidden_act != "silu":
-        raise ValueError(f"Llama activation {hf_config.hidden_act!r} is not silu")
-    n_heads = hf_config.num_attention_heads
-    n_kv = getattr(hf_config, "num_key_value_heads", None) or n_heads
-    if n_kv != n_heads:
-        raise ValueError(f"grouped-query attention ({n_kv} key/value heads for {n_heads} query heads) is not modeled")
-    rope_type, theta = _rope_settings(hf_config)
-    if rope_type != "default":
-        raise ValueError(f"rotary variant {rope_type!r} is not modeled (only plain RoPE)")
-    if getattr(hf_config, "attention_bias", False) or getattr(hf_config, "mlp_bias", False):
-        raise ValueError("attention or MLP biases are not modeled for Llama")
-    head_dim = getattr(hf_config, "head_dim", None)
-    if head_dim is not None and head_dim * n_heads != hf_config.hidden_size:
-        raise ValueError(f"head_dim {head_dim} x {n_heads} heads != hidden_size {hf_config.hidden_size}")
-    cfg = host.TransformerConfig(
-        name=name,
-        vocab_size=hf_config.vocab_size,
-        context_length=hf_config.max_position_embeddings,   # the trained context; RoPE itself has no limit
-        d_model=hf_config.hidden_size,
-        n_heads=n_heads,
-        n_layers=hf_config.num_hidden_layers,
-        d_ff=hf_config.intermediate_size,
-        norm="rmsnorm",
-        norm_eps=float(hf_config.rms_norm_eps),
-        norm_placement="pre",
-        activation="silu",
-        ffn="glu",
-        positional_encoding="rope",
-        rope_theta=theta,
-        tie_embeddings=bool(hf_config.tie_word_embeddings),
-        bias=False,
-    )
-    cfg.validate()
-    return cfg
+    return hf_families.llama_config_from_hf(hf_config, name=name)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -130,38 +88,13 @@ def llama_params_from_hf(state_dict: dict[str, Tensor], cfg: host.TransformerCon
 
     No layout changes: Hugging Face's nn.Linear weights are already (D_out, D_in), as
     inference.linear expects, and q_proj / k_proj are already in the rotate_half row order our rope
-    uses (see the module docstring). With tied embeddings lm_head.weight is the embedding itself
-    and is skipped (checked to be equal). Returns detached copies, and raises if any of our
-    parameters is missing or has the wrong shape.
+    uses (see the module docstring). With grouped-query attention k_proj / v_proj are
+    (n_kv_heads Dh, D); with attention_bias or mlp_bias their biases map to bq/bk/bv/bo and
+    b1/b3/b2. With tied embeddings lm_head.weight is the embedding itself and is skipped (checked
+    to be equal). Returns detached copies, and raises if any of our parameters is missing or has
+    the wrong shape, or if the state dict has an entry no stage uses (reference/hf_families.py).
     """
-    sd = {name.removeprefix("model."): t.detach() for name, t in state_dict.items()}
-    params: dict[str, Tensor] = {"tok_emb": sd["embed_tokens.weight"]}
-    for i in range(cfg.n_layers):
-        h, p = f"layers.{i}", f"layers.{i}"
-        params[f"{p}.norm1.gamma"] = sd[f"{h}.input_layernorm.weight"]
-        for ours, theirs in (("wq", "q_proj"), ("wk", "k_proj"), ("wv", "v_proj"), ("wo", "o_proj")):
-            params[f"{p}.attn.{ours}"] = sd[f"{h}.self_attn.{theirs}.weight"]
-        params[f"{p}.norm2.gamma"] = sd[f"{h}.post_attention_layernorm.weight"]
-        params[f"{p}.ffn.w1"] = sd[f"{h}.mlp.gate_proj.weight"]
-        params[f"{p}.ffn.w3"] = sd[f"{h}.mlp.up_proj.weight"]
-        params[f"{p}.ffn.w2"] = sd[f"{h}.mlp.down_proj.weight"]
-    params["norm_f.gamma"] = sd["norm.weight"]
-    head = sd.get("lm_head.weight")
-    if cfg.tie_embeddings:
-        if head is not None and not torch.equal(head, params["tok_emb"]):
-            raise ValueError("config says tied embeddings but lm_head.weight differs from embed_tokens.weight")
-    else:
-        if head is None:
-            raise KeyError("untied embeddings but the state dict has no lm_head.weight")
-        params["lm_head"] = head
-
-    expected = host.param_shapes(cfg)
-    if params.keys() != expected.keys():
-        raise KeyError(f"names differ from param_shapes: {sorted(params.keys() ^ expected.keys())}")
-    for name, shape in expected.items():
-        if tuple(params[name].shape) != shape:
-            raise ValueError(f"{name}: checkpoint shape {tuple(params[name].shape)} != expected {shape}")
-    return {name: t.contiguous().clone() for name, t in params.items()}
+    return hf_families.llama_params_from_hf(state_dict, cfg)
 
 
 def permute_rotary_rows(w: Tensor, n_heads: int) -> Tensor:

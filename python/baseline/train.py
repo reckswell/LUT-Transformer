@@ -477,3 +477,37 @@ def training_loop(
         "tokens_seen": tokens_seen,
         "tokens_per_s": tokens_seen / total.elapsed_s if total.elapsed_s > 0 else None,
     }
+
+
+# ----------------------------------------------------------------------------------------------
+# Additions for other model families (2026-11-24): exact GELU, shared key/value heads
+# ----------------------------------------------------------------------------------------------
+
+_INV_SQRT2 = 1.0 / math.sqrt(2.0)
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+
+def gelu_exact_forward(x: Tensor) -> tuple[Tensor, Cache]:
+    """GELU, exact form: y = x Phi(x), Phi(x) = 0.5 (1 + erf(x / sqrt 2)) (see inference.gelu_exact).
+    Saves x and Phi(x)."""
+    phi_cdf = 0.5 * (1.0 + torch.erf(x * _INV_SQRT2))
+    return x * phi_cdf, {"x": x, "cdf": phi_cdf}
+
+
+def gelu_exact_backward(dy: Tensor, cache: Cache) -> Tensor:
+    """dx = dy (Phi(x) + x phi(x)), with phi(x) = exp(-x^2 / 2) / sqrt(2 pi) the normal density.
+
+    Product rule on y = x Phi(x), using Phi'(x) = phi(x).
+    """
+    x = cache["x"]
+    density = torch.exp(-0.5 * x * x) * _INV_SQRT_2PI
+    return dy * (cache["cdf"] + x * density)
+
+
+def repeat_kv_backward(d: Tensor, n_rep: int) -> Tensor:
+    """Reverse of inference.repeat_kv: (B, Hkv * n_rep, S, Dh) -> (B, Hkv, S, Dh). Each key/value
+    head was read by n_rep query heads, so its gradient is the sum of theirs."""
+    if n_rep == 1:
+        return d
+    b, h, s, dh = d.shape
+    return d.reshape(b, h // n_rep, n_rep, s, dh).sum(dim=2)

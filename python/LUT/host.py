@@ -22,6 +22,16 @@ wiring is a line-for-line copy of baseline/host.py's, so with every stage on BAS
 give bit-identical results; tests/test_lut_wiring.py checks that (control arm 2). When the wiring
 here is changed on purpose, that test switches to a float tolerance with a stated reason.
 
+Every stage line is a set of slots, one per technique (LUT/stages.py Stage): a LUT architecture
+(lut), quantization of each run-time input (quant, and quant_b for the second operand of QK^T, PV
+and the gate), offline preparation of the weights (weight), smoothing (smooth) and replacement
+nonlinear functions (alt: the softmax exp, the norms' rsqrt, the activation). KV_CACHE sets how the
+KV cache stores keys and values, and CALIBRATION names the calibrated ranges that static scales
+and smoothing use. Each slot defaults to the baseline, and a stage with every slot at its default
+runs the baseline function itself, so the defaults are bit-identical to baseline/host.py and run
+exactly as fast (tests/test_lut_slots.py, bench/slot_parity.py). The techniques themselves are
+functions in LUT/techniques.py (quantization, D4, Alpha's) and LUT/nonlinear.py.
+
 What this file still takes from baseline/ is listed at the imports, each with the reason it is
 not wiring. The baseline building blocks themselves (baseline/inference.py and train.py) are what
 a BASE stage means, so every stage starts from the same functions in both models.
@@ -29,6 +39,7 @@ a BASE stage means, so every stage starts from the same functions in both models
     cd python
     python -m LUT.host info                       # print the toggles and check every function exists
     python -m LUT.host info --preset all_base     # a named set of toggles from PRESETS
+    python -m LUT.host info --preset int8_w8a8    # a precision preset (LUT/presets.py)
     python -m LUT.host train | evaluate | generate  ...   (window 1 and 2)
 
 In hardware each stage setting is a different circuit, so an HLS port turns these globals into
@@ -68,8 +79,9 @@ from baseline import host as base
 from baseline import inference, train
 from common import precision
 from common.quant import QuantSpec  # noqa: F401  (for QuantSpec(...) in the stage lines below)
-from LUT import ops_registry
-from LUT.stages import BASE, LUTArch, Stage  # noqa: F401  (LUTArch: for the stage lines below)
+from LUT import observer as calibration
+from LUT import ops_registry, presets
+from LUT.stages import BASE, KV_BASE, KVStore, LUTArch, Stage  # noqa: F401  (LUTArch, KVStore: for the lines below)
 
 # ==============================================================================================
 # PARAMETERS: edit these (like a SystemVerilog module's parameter list)
@@ -86,8 +98,9 @@ from LUT.stages import BASE, LUTArch, Stage  # noqa: F401  (LUTArch: for the sta
 DTYPE          = torch.float32      # float dtype everywhere a stage isn't quantized (TF32 off: common/precision.py)
 DATA_BITS      = 8                  # QuantSpec.bits: integer width of a quantized stage input
 DATA_SIGNED    = True               # QuantSpec.signed: two's complement
-                                    # (fraction bits / scales are part of decision D4; QuantSpec has
-                                    #  no field for them yet, and no accumulator width either)
+ACC_BITS       = 32                 # QuantSpec.acc_bits: accumulator width of a quantized multiply-accumulate
+                                    # (scales, granularity, static or dynamic, percentile: the other
+                                    #  QuantSpec fields, common/quant.py; the technique is decision D4)
 LUT_ARCH       = "<architecture>"   # LUTArch.name: a key of inference_lut.ARCHITECTURES (none until D5)
 LUT_INPUTS     = 2                  # LUTArch.inputs_per_table, k
 LUT_INPUT_BITS = 4                  # LUTArch.bits_per_input, b: address bits = k * b = 8, so 256 entries
@@ -96,20 +109,30 @@ LUT_ACC_BITS   = 24                 # LUTArch.acc_bits: integer accumulator for 
 
 # One line per stage, in the order the model runs them. A stage the model doesn't have (ROPE in a
 # model without rotary positions, FFN_GATE without a gated feed-forward) is listed as "not in this
-# model" by `info` and does nothing. Each is BASE or
-# Stage(lut=LUTArch(...), quant=QuantSpec(...), layers=(...)), and every field is optional:
-#   lut     a LUT architecture instead of the baseline function
-#   quant   quantize this stage's inputs (with or without a LUT); window 2, decision D4
-#   layers  which decoder layers (counted from 0) get the setting; the others run BASE
-# A mixed design, for example:
+# model" by `info` and does nothing. Each is BASE or Stage(...) with any of these slots (each
+# optional, each defaulting to the baseline; LUT/stages.py has the details):
+#   lut      a LUT architecture instead of the baseline function (decision D5)
+#   quant    quantize the stage's first (or only) run-time input, with or without a LUT (D4)
+#   quant_b  quantize the second run-time input: k in ATTN_SCORES, v in ATTN_VALUES, W3 h in FFN_GATE
+#   weight   prepare the stage's weights once, offline (a QuantSpec: quantized weights)
+#   smooth   SmoothQuant-style smoothing of a linear stage's input, alpha in [0, 1]
+#   alt      replacement nonlinear functions: {"exp": ...} in SOFTMAX, {"rsqrt": ...} in NORM and
+#            FINAL_NORM, {"act": ...} in FFN_ACT (names in LUT/nonlinear.py)
+#   layers   which decoder layers (counted from 0) get the setting; the others run BASE
+# A line can also be a list of Stages for different settings in different layers; a later entry
+# wins for the layers it names. A mixed design, for example:
 #
 #   ATTN_VALUES = Stage(lut=LUTArch(LUT_ARCH, LUT_INPUTS, LUT_INPUT_BITS, LUT_OUT_BITS, LUT_ACC_BITS),
 #                       layers=(1, 2, 3))                         # a LUT in layers 1 to 3, BASE in layer 0
-#   QKV_PROJ    = Stage(quant=QuantSpec(bits=DATA_BITS, signed=DATA_SIGNED))   # quantized, no LUT
+#   QKV_PROJ    = Stage(quant=QuantSpec(bits=DATA_BITS, percentile=99.99, acc_bits=ACC_BITS),
+#                       weight=QuantSpec(bits=DATA_BITS, granularity="per_channel", axis=0))   # W8A8, no LUT
+#   ATTN_SCORES = Stage(quant=QuantSpec(bits=8), quant_b=QuantSpec(bits=4))    # Q at 8 bits, K at 4
+#   FFN_DOWN    = [Stage(quant=QuantSpec(bits=8)), Stage(quant=QuantSpec(bits=4), layers=(2,))]
 #   SOFTMAX     = BASE                                            # baseline function, float inputs
 #
-# A stage that names something not written yet (an unknown architecture, or any quant before D4)
-# fails when lut_ops() builds the model, before a run starts.
+# A stage that names something not written yet (an unknown architecture, a technique in
+# LUT/techniques.py still pending D4) or a static scale without CALIBRATION fails when lut_ops()
+# builds the model, before a run starts.
 
 EMBEDDING   = BASE   # embedding     token lookup             BASE | Stage(lut, quant)  (layers ignored)
 NORM        = BASE   # norm          LayerNorm or RMSNorm     BASE | Stage(lut, quant, layers)  (both norms in a layer)
@@ -125,6 +148,16 @@ FFN_GATE    = BASE   # ffn_gate      act(W1 h) * (W3 h)       BASE | Stage(lut, 
 FFN_DOWN    = BASE   # ffn_down      F -> D linear            BASE | Stage(lut, quant, layers)
 FINAL_NORM  = BASE   # final_norm    norm before the output   BASE | Stage(lut, quant)  (layers ignored)
 LM_HEAD     = BASE   # lm_head       output layer             BASE | Stage(lut, quant)  (layers ignored; most of a small model's per-token compute)
+
+# How the KV cache stores keys and values: KV_BASE (as they are, like the baseline) or
+# KVStore(k=QuantSpec(...), v=QuantSpec(...), k_before_rope=False, layers=None). k and v are set
+# separately; k_before_rope stores unrotated keys and rotates them on every read.
+KV_CACHE    = KV_BASE
+
+# Calibrated ranges for static scales and smoothing: None, or a file written by
+# calibrate(...).save(path) on calibration text (never the evaluation text). Only read when a
+# stage line asks for a static scale or smoothing.
+CALIBRATION = None
 
 # Training: False trains the float baseline and applies the LUT stages afterwards, for inference
 # only (post-training, the plan's default). True runs the LUT stages from LUT/train_lut.py in the
@@ -145,9 +178,10 @@ def init_params(cfg: base.TransformerConfig, *, seed: int, device: str = "cpu") 
     return base.init_params(cfg, seed=seed, device=device, dtype=DTYPE)
 
 
-def parameter_toggles() -> dict[str, Stage]:
-    """The stage lines above as {stage name: Stage}, read at the moment of the call, so an
-    override like lut_host.SOFTMAX = Stage(...) takes effect the next time lut_ops() runs."""
+def parameter_toggles() -> dict[str, Any]:
+    """The stage lines above as {stage name: Stage (or a list of Stages)}, plus "kv_cache": KV_CACHE,
+    read at the moment of the call, so an override like lut_host.SOFTMAX = Stage(...) takes effect
+    the next time lut_ops() runs."""
     return {
         "norm": NORM,
         "qkv_proj": QKV_PROJ,
@@ -163,35 +197,61 @@ def parameter_toggles() -> dict[str, Stage]:
         "embedding": EMBEDDING,
         "final_norm": FINAL_NORM,
         "lm_head": LM_HEAD,
+        "kv_cache": KV_CACHE,
     }
 
 
 # Named sets of toggles that don't come from the PARAMETERS block. "all_base" is every stage on
 # BASE: the LUT wiring with the baseline building blocks, control arm 2 in tests/test_lut_wiring.py
-# and eval/. It never overrides the stage lines above; it is only used when asked for by name.
-PRESETS: dict[str, dict[str, Stage]] = {
+# and eval/. The others come from LUT/presets.py: the four low-precision configurations (FP16
+# inputs, FP8, INT8 W8A8, INT4 W4A8) and the advisor's one-point-at-a-time sweep (names starting
+# "sweep_"). They never override the stage lines above; they are only used when asked for by name.
+PRESETS: dict[str, dict[str, Any]] = {
     "all_base": {stage: BASE for stage in base.STAGES},
+    **presets.precision_presets(),
+    **presets.sweep_presets(),
 }
 
 
-def preset_toggles(name: str = "parameters") -> dict[str, Stage]:
+def preset_toggles(name: str = "parameters") -> dict[str, Any]:
     """"parameters" (the default) reads the PARAMETERS block now; any other name is a PRESETS entry."""
     return parameter_toggles() if name == "parameters" else PRESETS[name]
 
 
-def lut_ops(cfg: base.TransformerConfig, mode: base.Mode, toggles: dict[str, Stage] | None = None,
-            *, train_with_luts: bool | None = None) -> base.ModelOps:
+def lut_ops(cfg: base.TransformerConfig, mode: base.Mode, toggles: dict[str, Any] | None = None,
+            *, train_with_luts: bool | None = None, observer: calibration.Observer | None = None,
+            ranges: dict[str, calibration.Ranges] | None = None) -> base.ModelOps:
     """The function each stage calls in the wiring below, with the toggled stages swapped in.
 
     toggles None reads the PARAMETERS block at this moment. In "train" mode with train_with_luts
     False (the TRAIN_WITH_LUTS default), every stage trains on its baseline function and the LUTs
     are applied afterwards, for inference only.
+    observer: record every stage input for calibration (see calibrate()); outputs are unchanged.
+    ranges: calibrated ranges for static scales and smoothing; None reads the CALIBRATION file,
+    if one is set.
     """
     chosen = parameter_toggles() if toggles is None else toggles
     train_with_luts = TRAIN_WITH_LUTS if train_with_luts is None else train_with_luts
     if mode == "train" and not train_with_luts:
         chosen = PRESETS["all_base"]
-    return ops_registry.resolve_ops(chosen, cfg, mode)
+    if ranges is None and CALIBRATION is not None:
+        ranges = calibration.load(CALIBRATION)
+    return ops_registry.resolve_ops(chosen, cfg, mode, observer=observer, ranges=ranges)
+
+
+def calibrate(params: dict, cfg: base.TransformerConfig, batches: Any, *, kv: KVStore = KV_BASE,
+              observer: calibration.Observer | None = None) -> calibration.Observer:
+    """Run the model with every stage on BASE over `batches` (token ids, each (B, T)) and record the
+    range of every stage input in every layer, every linear stage's weights and what each layer
+    writes into the KV cache. kv: the KV layout to record (KVStore(k_before_rope=True) records
+    unrotated keys). Returns the Observer; observer.save(path) writes the file CALIBRATION names."""
+    obs = observer if observer is not None else calibration.Observer()
+    toggles = {**PRESETS["all_base"], "kv_cache": KVStore(k_before_rope=kv.k_before_rope, layers=kv.layers)}
+    ops = lut_ops(cfg, "inference", toggles, observer=obs, ranges={})
+    with torch.no_grad():
+        for ids in batches:
+            forward(params, ids, ops, cfg)
+    return obs
 
 
 # ----------------------------------------------------------------------------------------------
@@ -206,6 +266,7 @@ def lut_ops(cfg: base.TransformerConfig, mode: base.Mode, toggles: dict[str, Sta
 #   h  = L["norm"](x)                                  # norm1
 #   q, k, v = L["qkv_proj"](h, Wq), (h, Wk), (h, Wv)   # three projections, then split_heads
 #   q, k = L["rope"](q, cos, sin), L["rope"](k, cos, sin)   # rotary positions only (Llama)
+#   k, v = L["kv_store"](k, v)                         # only if KV_CACHE stores them differently
 #   s  = L["attn_scores"](q, k, causal_mask)           # QK^T / sqrt(Dh), masked
 #   p  = L["softmax"](s)
 #   a  = L["attn_values"](p, v)                        # PV, then merge_heads
@@ -216,7 +277,10 @@ def lut_ops(cfg: base.TransformerConfig, mode: base.Mode, toggles: dict[str, Sta
 #   x  = x + L["ffn_down"](z, W2)                      # residual
 #
 # With rotary positions, k is rotated before it goes into the KV cache, so the cache holds rotated
-# keys and a decode step only rotates its own new q and k.
+# keys and a decode step only rotates its own new q and k. KVStore(k_before_rope=True) stores the
+# unrotated keys instead and rotates every cached key by its own position on each read. The
+# "kv_store" entry exists only in layers whose KV_CACHE setting isn't KV_BASE (or while
+# calibrating), so with the defaults this is the baseline's order of operations exactly.
 #
 # Whole model: tokens -> ops.embedding (+ positions) -> n_layers blocks -> ops.final_norm ->
 # ops.lm_head -> logits. Every stage is called through `ops`, never directly, so the toggles
@@ -236,7 +300,36 @@ def _rope_tables(length: int, start: int, cfg: base.TransformerConfig, like: Ten
     and shared by every layer, like a position ROM."""
     if cfg.positional_encoding != "rope":
         return None
-    return inference.rope_tables(length, cfg.head_dim, cfg.rope_theta, start, device=like.device, dtype=like.dtype)
+    return inference.rope_tables(length, cfg.rotary_columns, cfg.rope_theta, start, device=like.device, dtype=like.dtype)
+
+
+def _rotate(fn: Callable, x: Tensor, rope: tuple[Tensor, Tensor], cfg: base.TransformerConfig) -> Tensor:
+    """Call the rope stage on the first cfg.rotary_columns columns of each head and pass the
+    others through unchanged (partial rotary: GPT-NeoX, Phi). With every column rotated (the
+    default) this is the rope stage itself. The split and the join are re-indexings."""
+    rd = cfg.rotary_columns
+    if rd == x.shape[-1]:
+        return fn(x, *rope)
+    return torch.cat((fn(x[..., :rd], *rope), x[..., rd:]), dim=-1)
+
+
+def _shared_kv(x: Tensor, cfg: base.TransformerConfig) -> Tensor:
+    """Grouped-query attention: each key/value head serves n_heads / n_kv_heads query heads, so
+    repeat it that many times, (B, Hkv, S, Dh) -> (B, H, S, Dh), as Hugging Face's repeat_kv does.
+    A re-indexing. Without grouped-query attention, x itself."""
+    if cfg.kv_heads == cfg.n_heads:
+        return x
+    return inference.repeat_kv(x, cfg.n_heads // cfg.kv_heads)
+
+
+def _attention_mask(t_query: int, t_key: int, offset: int, cfg: base.TransformerConfig, device: Any) -> Tensor:
+    """The causal mask, (t_query, t_key) boolean. With a sliding window, query i (at position
+    offset + i) also loses every key at least attention_window positions back, which is the causal
+    mask shifted by the window, inverted. A comparison of positions: no arithmetic on activations."""
+    mask = inference.causal_mask(t_query, t_key, offset, device=device)
+    if cfg.attention_window is not None:
+        mask = mask & ~inference.causal_mask(t_query, t_key, offset - cfg.attention_window, device=device)
+    return mask
 
 
 def _embed(params: dict, token_ids: Tensor, start: int, ops: base.ModelOps, cfg: base.TransformerConfig) -> Tensor:
@@ -244,6 +337,8 @@ def _embed(params: dict, token_ids: Tensor, start: int, ops: base.ModelOps, cfg:
     token_ids (B, T) -> (B, T, D). Rotary positions add nothing here (they rotate q and k inside
     attention)."""
     x = ops.embedding(token_ids, params["tok_emb"])
+    if cfg.embed_scale is not None:
+        x = x * cfg.embed_scale                                  # Gemma: sqrt(d_model)
     t = token_ids.shape[1]
     if cfg.positional_encoding == "learned":
         x = x + inference.learned_positions(t, params["pos_emb"], start)
@@ -262,14 +357,24 @@ def _attention(layer: dict, params: dict, prefix: str, h: Tensor, cfg: base.Tran
     q = layer["qkv_proj"](h, params[f"{prefix}.wq"], params.get(f"{prefix}.bq"))   # (B, T, D)
     k = layer["qkv_proj"](h, params[f"{prefix}.wk"], params.get(f"{prefix}.bk"))
     v = layer["qkv_proj"](h, params[f"{prefix}.wv"], params.get(f"{prefix}.bv"))
-    q, k, v = (inference.split_heads(z, cfg.n_heads) for z in (q, k, v))           # (B, H, T, Dh)
+    q = inference.split_heads(q, cfg.n_heads)                                       # (B, H, T, Dh)
+    k, v = inference.split_heads(k, cfg.kv_heads), inference.split_heads(v, cfg.kv_heads)   # (B, Hkv, T, Dh)
+    store = layer.get("kv_store")      # how keys and values are stored (KV_CACHE); None: as they are
+    k_before_rope = store is not None and store.k_before_rope
     if rope is not None:                                                            # rotate q and k, not v
-        q, k = layer["rope"](q, *rope), layer["rope"](k, *rope)
+        q = _rotate(layer["rope"], q, rope, cfg)
+        if not k_before_rope:
+            k = _rotate(layer["rope"], k, rope, cfg)
+    if store is not None:
+        k, v = store(k, v)                                                          # what the cache gives back
     offset = 0
     if cache is not None:
         offset = cache.length
-        k, v = cache.append(layer_index, k, v)                                      # (B, H, offset+T, Dh)
-    mask = inference.causal_mask(t, k.shape[2], offset, device=h.device)            # (T, offset+T)
+        k, v = cache.append(layer_index, k, v)                                      # (B, Hkv, offset+T, Dh)
+    if k_before_rope and rope is not None:                                          # rotate every stored key
+        k = _rotate(layer["rope"], k, _rope_tables(k.shape[2], 0, cfg, k), cfg)     # by its own position
+    k, v = _shared_kv(k, cfg), _shared_kv(v, cfg)                                   # (B, H, offset+T, Dh)
+    mask = _attention_mask(t, k.shape[2], offset, cfg, h.device)                    # (T, offset+T)
     s = layer["attn_scores"](q, k, mask)                                            # (B, H, T, offset+T)
     probs = layer["softmax"](s)
     a = layer["attn_values"](probs, v)                                              # (B, H, T, Dh)
@@ -293,6 +398,11 @@ def _block(i: int, x: Tensor, params: dict, ops: base.ModelOps, cfg: base.Transf
     def norm(z: Tensor, which: str) -> Tensor:
         return _norm(layer["norm"], z, params, f"{p}.{which}", cfg)
 
+    if cfg.parallel_block:                               # both branches read x (GPT-NeoX, Phi)
+        h = norm(x, "norm1")
+        attn = _attention(layer, params, f"{p}.attn", h, cfg, cache, i, rope)
+        h = h if cfg.block == "parallel_shared_norm" else norm(x, "norm2")
+        return x + (attn + _feed_forward(layer, params, f"{p}.ffn", h, cfg))
     if cfg.norm_placement == "pre":
         x = x + _attention(layer, params, f"{p}.attn", norm(x, "norm1"), cfg, cache, i, rope)
         return x + _feed_forward(layer, params, f"{p}.ffn", norm(x, "norm2"), cfg)
@@ -319,7 +429,7 @@ def _head(params: dict, x: Tensor, ops: base.ModelOps, cfg: base.TransformerConf
     output weight is the token table itself, logits = x @ tok_emb^T."""
     h = _norm(ops.final_norm, x, params, "norm_f", cfg)
     weight = params["tok_emb"] if cfg.tie_embeddings else params["lm_head"]
-    return ops.lm_head(h, weight)
+    return ops.lm_head(h, weight, params.get("lm_head_bias"))
 
 
 def forward(params: dict, token_ids: Tensor, ops: base.ModelOps, cfg: base.TransformerConfig) -> Tensor:
@@ -333,7 +443,7 @@ def new_cache(params: dict, cfg: base.TransformerConfig, batch: int, max_len: in
     """An empty KV cache for `batch` sequences of up to max_len tokens, on the parameters' device
     and dtype."""
     ref = params["tok_emb"]
-    return inference.KVCache.allocate(cfg.n_layers, batch, cfg.n_heads, max_len, cfg.head_dim,
+    return inference.KVCache.allocate(cfg.n_layers, batch, cfg.kv_heads, max_len, cfg.head_dim,
                                       device=ref.device, dtype=ref.dtype)
 
 
@@ -407,6 +517,31 @@ def _linear_backward(pair: tuple, dy: Tensor, cache: Any, w_name: str, b_name: s
     return dx
 
 
+def _rotate_forward(forward: Callable, x: Tensor, rope: tuple[Tensor, Tensor], cfg: base.TransformerConfig) -> tuple[Tensor, Any]:
+    """_rotate in training: rope_forward on the rotated columns, the rest passed through."""
+    rd = cfg.rotary_columns
+    if rd == x.shape[-1]:
+        return forward(x, *rope)
+    y, cache = forward(x[..., :rd], *rope)
+    return torch.cat((y, x[..., rd:]), dim=-1), cache
+
+
+def _rotate_backward(backward: Callable, dy: Tensor, cache: Any, cfg: base.TransformerConfig) -> Tensor:
+    """Reverse of _rotate_forward: rope_backward on the rotated columns, the rest passed through."""
+    rd = cfg.rotary_columns
+    if rd == dy.shape[-1]:
+        return backward(dy, cache)
+    return torch.cat((backward(dy[..., :rd], cache), dy[..., rd:]), dim=-1)
+
+
+def _shared_kv_backward(d: Tensor, cfg: base.TransformerConfig) -> Tensor:
+    """Reverse of _shared_kv: each key/value head gets the sum of the gradients of the query heads
+    that shared it, (B, H, S, Dh) -> (B, Hkv, S, Dh)."""
+    if cfg.kv_heads == cfg.n_heads:
+        return d
+    return train.repeat_kv_backward(d, cfg.n_heads // cfg.kv_heads)
+
+
 def _attention_train(layer: dict, params: dict, p: str, h: Tensor, cfg: base.TransformerConfig,
                      rope: tuple[Tensor, Tensor] | None) -> tuple[Tensor, dict]:
     """Attention forward with caches (no KV cache: training sees whole sequences)."""
@@ -415,14 +550,14 @@ def _attention_train(layer: dict, params: dict, p: str, h: Tensor, cfg: base.Tra
     qkv = {}
     for name in ("q", "k", "v"):
         out, c[name] = layer["qkv_proj"][0](h, params[f"{p}.w{name}"], params.get(f"{p}.b{name}"))
-        qkv[name] = inference.split_heads(out, cfg.n_heads)
+        qkv[name] = inference.split_heads(out, cfg.n_heads if name == "q" else cfg.kv_heads)
     if rope is not None:
-        qkv["q"], c["rope_q"] = layer["rope"][0](qkv["q"], *rope)
-        qkv["k"], c["rope_k"] = layer["rope"][0](qkv["k"], *rope)
-    mask = inference.causal_mask(t, t, device=h.device)
-    s, c["scores"] = layer["attn_scores"][0](qkv["q"], qkv["k"], mask)
+        qkv["q"], c["rope_q"] = _rotate_forward(layer["rope"][0], qkv["q"], rope, cfg)
+        qkv["k"], c["rope_k"] = _rotate_forward(layer["rope"][0], qkv["k"], rope, cfg)
+    mask = _attention_mask(t, t, 0, cfg, h.device)
+    s, c["scores"] = layer["attn_scores"][0](qkv["q"], _shared_kv(qkv["k"], cfg), mask)
     probs, c["softmax"] = layer["softmax"][0](s)
-    a, c["values"] = layer["attn_values"][0](probs, qkv["v"])
+    a, c["values"] = layer["attn_values"][0](probs, _shared_kv(qkv["v"], cfg))
     out, c["out"] = layer["out_proj"][0](inference.merge_heads(a), params[f"{p}.wo"], params.get(f"{p}.bo"))
     return out, c
 
@@ -433,8 +568,10 @@ def _attention_backward(layer: dict, d_out: Tensor, c: dict, p: str, grads: dict
     d_probs, dv = layer["attn_values"][1](inference.split_heads(da, cfg.n_heads), c["values"])
     ds = layer["softmax"][1](d_probs, c["softmax"])
     dq, dk = layer["attn_scores"][1](ds, c["scores"])
+    dk, dv = _shared_kv_backward(dk, cfg), _shared_kv_backward(dv, cfg)   # sum over the heads sharing each
     if "rope_q" in c:                                    # undo the rotation (rope_backward)
-        dq, dk = layer["rope"][1](dq, c["rope_q"]), layer["rope"][1](dk, c["rope_k"])
+        dq = _rotate_backward(layer["rope"][1], dq, c["rope_q"], cfg)
+        dk = _rotate_backward(layer["rope"][1], dk, c["rope_k"], cfg)
     d_h = 0
     for name, d_heads in (("q", dq), ("k", dk), ("v", dv)):
         d_h = d_h + _linear_backward(layer["qkv_proj"], inference.merge_heads(d_heads), c[name],
@@ -472,6 +609,8 @@ def forward_train(params: dict, token_ids: Tensor, ops: base.ModelOps, cfg: base
         raise NotImplementedError("dropout > 0 is not wired into forward_train yet (every config uses 0.0)")
     caches: dict[str, Any] = {"T": token_ids.shape[1], "layers": []}
     x, caches["embedding"] = ops.embedding[0](token_ids, params["tok_emb"])
+    if cfg.embed_scale is not None:
+        x = x * cfg.embed_scale
     t = token_ids.shape[1]
     if cfg.positional_encoding == "learned":
         x = x + params["pos_emb"][:t]
@@ -480,7 +619,14 @@ def forward_train(params: dict, token_ids: Tensor, ops: base.ModelOps, cfg: base
     rope = _rope_tables(t, 0, cfg, x)                    # None unless rotary positions
     for i in range(cfg.n_layers):
         layer, p, c = ops.layers[i], f"layers.{i}", {}
-        if cfg.norm_placement == "pre":
+        if cfg.parallel_block:
+            h, c["norm1"] = _norm_forward(layer["norm"], x, params, f"{p}.norm1", cfg)
+            attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", h, cfg, rope)
+            if cfg.block == "parallel":
+                h, c["norm2"] = _norm_forward(layer["norm"], x, params, f"{p}.norm2", cfg)
+            ffn, c["ffn"] = _ffn_train(layer, params, f"{p}.ffn", h, cfg)
+            x = x + (attn + ffn)
+        elif cfg.norm_placement == "pre":
             h, c["norm1"] = _norm_forward(layer["norm"], x, params, f"{p}.norm1", cfg)
             attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", h, cfg, rope)
             x = x + attn
@@ -495,7 +641,7 @@ def forward_train(params: dict, token_ids: Tensor, ops: base.ModelOps, cfg: base
         caches["layers"].append(c)
     h, caches["final_norm"] = _norm_forward(ops.final_norm, x, params, "norm_f", cfg)
     weight = params["tok_emb"] if cfg.tie_embeddings else params["lm_head"]
-    logits, caches["lm_head"] = ops.lm_head[0](h, weight)
+    logits, caches["lm_head"] = ops.lm_head[0](h, weight, params.get("lm_head_bias"))
     return logits, caches
 
 
@@ -503,11 +649,24 @@ def backward(d_logits: Tensor, caches: dict, ops: base.ModelOps, cfg: base.Trans
     """Backpropagate d_logits through the model in reverse order. Returns {param name: gradient},
     with residual-branch gradients summed and tied-embedding gradients added together."""
     grads: dict[str, Tensor] = {}
-    dh, d_head, _ = ops.lm_head[1](d_logits, caches["lm_head"])
+    dh, d_head, d_head_bias = ops.lm_head[1](d_logits, caches["lm_head"])
+    if d_head_bias is not None:
+        grads["lm_head_bias"] = d_head_bias
     dx = _norm_backward(ops.final_norm, dh, caches["final_norm"], "norm_f", grads, cfg)
     for i in reversed(range(cfg.n_layers)):
         layer, p, c = ops.layers[i], f"layers.{i}", caches["layers"][i]
-        if cfg.norm_placement == "pre":
+        if cfg.block == "parallel":
+            # x_out = x_in + (attn(norm1 x_in) + ffn(norm2 x_in)): dx reaches x_in directly and through both.
+            d_branch = _ffn_backward(layer, dx, c["ffn"], f"{p}.ffn", grads, cfg)
+            d_ffn = _norm_backward(layer["norm"], d_branch, c["norm2"], f"{p}.norm2", grads, cfg)
+            d_branch = _attention_backward(layer, dx, c["attn"], f"{p}.attn", grads, cfg)
+            dx = dx + (_norm_backward(layer["norm"], d_branch, c["norm1"], f"{p}.norm1", grads, cfg) + d_ffn)
+        elif cfg.block == "parallel_shared_norm":
+            # x_out = x_in + (attn(h) + ffn(h)), h = norm1 x_in: h's gradient is the sum of both branches'.
+            d_h = _attention_backward(layer, dx, c["attn"], f"{p}.attn", grads, cfg)
+            d_h = d_h + _ffn_backward(layer, dx, c["ffn"], f"{p}.ffn", grads, cfg)
+            dx = dx + _norm_backward(layer["norm"], d_h, c["norm1"], f"{p}.norm1", grads, cfg)
+        elif cfg.norm_placement == "pre":
             # x_out = x_mid + ffn(norm2(x_mid)): dx reaches x_mid directly and through the branch.
             d_branch = _ffn_backward(layer, dx, c["ffn"], f"{p}.ffn", grads, cfg)
             dx = dx + _norm_backward(layer["norm"], d_branch, c["norm2"], f"{p}.norm2", grads, cfg)
@@ -520,7 +679,7 @@ def backward(d_logits: Tensor, caches: dict, ops: base.ModelOps, cfg: base.Trans
             dx = d_sum + _ffn_backward(layer, d_sum, c["ffn"], f"{p}.ffn", grads, cfg)
             d_sum = _norm_backward(layer["norm"], dx, c["norm1"], f"{p}.norm1", grads, cfg)
             dx = d_sum + _attention_backward(layer, d_sum, c["attn"], f"{p}.attn", grads, cfg)
-    d_table = ops.embedding[1](dx, caches["embedding"])
+    d_table = ops.embedding[1](dx if cfg.embed_scale is None else dx * cfg.embed_scale, caches["embedding"])
     if cfg.tie_embeddings:
         grads["tok_emb"] = d_table + d_head          # used twice: input lookup and output layer
     else:
@@ -559,7 +718,7 @@ def _cmd_info(cfg: base.TransformerConfig, hw: dict, preset: str, fp: dict) -> N
     print(f"hw      {hw.get('name', '?')}: {hw['devices']}")
     print(f"dtype   {DTYPE}; float32 matmul precision {fp['float32_matmul_precision']}, "
           f"TF32 {'on' if fp['cuda_matmul_allow_tf32'] or fp['cudnn_allow_tf32'] else 'off'}")
-    print(f"preset  {preset}    train_with_luts: {TRAIN_WITH_LUTS}")
+    print(f"preset  {preset}    train_with_luts: {TRAIN_WITH_LUTS}    calibration: {CALIBRATION or 'none'}")
     print()
     print(f"{'stage':<13}{'runs':<26}{'k x b -> out':<14}{'table bits':>11}  {'layers':<8}quant")
     for row in ops_registry.describe(chosen, cfg):

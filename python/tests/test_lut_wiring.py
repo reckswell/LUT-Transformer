@@ -31,7 +31,7 @@ from baseline import host as base  # noqa: E402
 from baseline import inference  # noqa: E402
 from LUT import host as lut_host  # noqa: E402
 from LUT import inference_lut  # noqa: E402
-from LUT.stages import BASE, LUTArch, Stage  # noqa: E402
+from LUT.stages import BASE, KV_BASE, LUTArch, Stage  # noqa: E402
 from test_model_against_reference import VARIANTS  # noqa: E402
 from test_model_against_reference import _setup as setup_models  # noqa: E402
 from test_model_against_reference import _tokens as tokens  # noqa: E402
@@ -138,7 +138,8 @@ def test_default_parameters_are_the_baseline_building_blocks():
     # The committed PARAMETERS block (every stage BASE) gives exactly the baseline functions and
     # bit-identical logits: the defaults are control arm 2.
     cfg, params, _ = setup_models("gpt2_like")
-    assert all(stage == BASE for stage in lut_host.parameter_toggles().values())
+    toggles = lut_host.parameter_toggles()
+    assert all(toggles[stage] == BASE for stage in base.STAGES) and toggles["kv_cache"] == KV_BASE
     ops = lut_host.lut_ops(cfg, "inference")
     assert ops == base.base_ops(cfg, "inference")
     assert ops.layers[0]["softmax"] is inference.softmax and ops.lm_head is inference.linear
@@ -184,8 +185,10 @@ def test_parameters_block_comes_right_after_the_imports():
 SHARED_FROM_BASELINE = {
     "base": {"TransformerConfig", "Mode", "ModelOps", "STAGES", "load_configs", "add_common_args", "init_params"},
     "inference": {"KVCache", "split_heads", "merge_heads", "causal_mask", "sinusoidal_positions",
-                  "learned_positions", "rope_tables", "sample_next_token"},
-    "train": {"cross_entropy_forward", "cross_entropy_backward", "clip_grad_norm", "adamw_step"},
+                  "learned_positions", "rope_tables", "sample_next_token",
+                  "repeat_kv"},                  # grouped-query attention's re-indexing (no arithmetic)
+    "train": {"cross_entropy_forward", "cross_entropy_backward", "clip_grad_norm", "adamw_step",
+              "repeat_kv_backward"},
 }
 WIRING = ("forward", "new_cache", "prefill", "decode_step", "generate", "forward_train", "backward", "train_step")
 

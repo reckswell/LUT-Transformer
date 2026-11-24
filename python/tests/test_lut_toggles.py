@@ -80,7 +80,7 @@ def test_bad_toggles_fail_at_startup(dummy_arch):
 
 
 def test_toggles_list_every_stage_and_describe_reports_table_size(dummy_arch):
-    assert set(lut_host.parameter_toggles()) == set(base.STAGES)
+    assert set(lut_host.parameter_toggles()) == set(base.STAGES) | {"kv_cache"}
     rows = {row["stage"]: row for row in ops_registry.describe({"ffn_up": Stage(lut=DUMMY, layers=(0,))}, CFG)}
     assert rows["ffn_up"]["runs"] == "lut:dummy" and rows["ffn_up"]["table_bits"] == "4,096"
     assert rows["ffn_up"]["layers"] == "0" and rows["ffn_down"]["runs"] == "base:linear"

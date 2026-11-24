@@ -80,6 +80,30 @@ class TransformerConfig:
     Profiles switch on the rest: GPT-2 (configs/model/gpt2.yaml) uses LayerNorm, GELU, learned
     positions and biases; Llama (configs/model/stories15m.yaml) uses RMSNorm with eps 1e-5, SiLU in
     a gated feed-forward (ffn = glu, which with SiLU is SwiGLU) and rotary positions (rope).
+
+    Options for other model families (2026-11-24; reference/hf_families.py maps each Hugging Face
+    family onto them). Every default leaves the model above unchanged:
+      n_kv_heads    grouped-query attention: fewer key/value heads than query heads, each shared
+                    by n_heads / n_kv_heads query heads (Mistral, Qwen2, Gemma, Llama 3; 1 is
+                    multi-query). The KV cache holds n_kv_heads heads.
+      head_size     the head width Dh when it isn't d_model / n_heads (Gemma 7B: 256 for 3072 / 16).
+      qkv_bias, out_bias, ffn_bias
+                    biases on the Q/K/V projections, the attention output and the feed-forward,
+                    each on its own (Qwen2: Q/K/V only). None follows `bias`.
+      lm_head_bias  a bias on the output layer (Phi).
+      block         "sequential": attention then feed-forward, each added to the residual.
+                    "parallel": both read the same residual, x + attn(norm1 x) + ffn(norm2 x)
+                    (GPT-NeoX/Pythia). "parallel_shared_norm": the same with one norm,
+                    x + attn(norm1 x) + ffn(norm1 x), so a layer has no norm2 (Phi, GPT-J).
+      attention_window
+                    sliding-window attention: each query sees only the attention_window most
+                    recent keys, itself included (Mistral, Qwen2 with use_sliding_window). Only
+                    the mask changes; the KV cache still holds every position.
+      rotary_dim    rope only: rotate the first rotary_dim columns of each head and pass the rest
+                    through (GPT-NeoX 25 %, Phi 40 % of the head). None rotates all of them.
+      embed_scale   multiply the token embedding by this (Gemma: sqrt(d_model)).
+      activation    adds "gelu_exact", x * Phi(x) with the error function (GPT-NeoX's "gelu");
+                    "gelu" stays the tanh form (GPT-2's "gelu_new").
     """
 
     name: str = "core"
@@ -92,17 +116,47 @@ class TransformerConfig:
     norm: str = "rmsnorm"              # rmsnorm | layernorm
     norm_eps: float | None = None      # None: the norm's usual default (LayerNorm 1e-5, RMSNorm 1e-6)
     norm_placement: str = "pre"        # pre | post
-    activation: str = "relu"           # relu | gelu | silu
+    activation: str = "relu"           # relu | gelu | gelu_exact | silu
     ffn: str = "mlp"                   # mlp: down(act(up h)) | glu: down(act(up h) * (up3 h)), Llama's SwiGLU with silu
     positional_encoding: str = "sinusoidal"  # sinusoidal | learned | rope | none
     rope_theta: float = 10000.0        # rope only: the base of the rotary frequencies, theta^(-2i/Dh)
     tie_embeddings: bool = True
     bias: bool = False
     dropout: float = 0.0
+    n_kv_heads: int | None = None      # grouped-query attention (None: n_heads)
+    head_size: int | None = None       # head width when it isn't d_model / n_heads
+    qkv_bias: bool | None = None       # None: follow bias
+    out_bias: bool | None = None
+    ffn_bias: bool | None = None
+    lm_head_bias: bool = False
+    block: str = "sequential"          # sequential | parallel | parallel_shared_norm
+    attention_window: int | None = None  # sliding-window attention (None: every earlier key)
+    rotary_dim: int | None = None      # rope only: rotated columns per head (None: all)
+    embed_scale: float | None = None   # token embedding multiplier (None: 1)
 
     @property
     def head_dim(self) -> int:
-        return self.d_model // self.n_heads
+        return self.head_size if self.head_size is not None else self.d_model // self.n_heads
+
+    @property
+    def parallel_block(self) -> bool:
+        """Attention and feed-forward both read the layer's input (block parallel or parallel_shared_norm)."""
+        return self.block != "sequential"
+
+    @property
+    def kv_heads(self) -> int:
+        """Key/value heads: n_kv_heads, or n_heads without grouped-query attention."""
+        return self.n_kv_heads if self.n_kv_heads is not None else self.n_heads
+
+    def has_bias(self, where: str) -> bool:
+        """Whether the "qkv", "out" or "ffn" linear layers have biases."""
+        own = {"qkv": self.qkv_bias, "out": self.out_bias, "ffn": self.ffn_bias}[where]
+        return self.bias if own is None else own
+
+    @property
+    def rotary_columns(self) -> int:
+        """How many columns of each head rope rotates (all of them unless rotary_dim says less)."""
+        return self.rotary_dim if self.rotary_dim is not None else self.head_dim
 
     @property
     def norm_epsilon(self) -> float:
@@ -113,20 +167,30 @@ class TransformerConfig:
         return 1e-5 if self.norm == "layernorm" else 1e-6
 
     def validate(self) -> None:
-        if self.d_model % self.n_heads:
+        if self.head_size is None and self.d_model % self.n_heads:
             raise ValueError(f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})")
+        if self.n_heads % self.kv_heads:
+            raise ValueError(f"n_heads ({self.n_heads}) must be a multiple of n_kv_heads ({self.kv_heads})")
         if self.norm not in ("layernorm", "rmsnorm"):
             raise ValueError(f"norm must be layernorm or rmsnorm, got {self.norm!r}")
-        if self.activation not in ("relu", "gelu", "silu"):
-            raise ValueError(f"activation must be relu, gelu or silu, got {self.activation!r}")
+        if self.activation not in ("relu", "gelu", "gelu_exact", "silu"):
+            raise ValueError(f"activation must be relu, gelu, gelu_exact or silu, got {self.activation!r}")
+        if self.block not in ("sequential", "parallel", "parallel_shared_norm"):
+            raise ValueError(f"block must be sequential, parallel or parallel_shared_norm, got {self.block!r}")
+        if self.parallel_block and self.norm_placement != "pre":
+            raise ValueError("a parallel block needs pre-norm placement")
+        if self.attention_window is not None and self.attention_window < 1:
+            raise ValueError(f"attention_window must be at least 1, got {self.attention_window}")
+        if self.rotary_dim is not None and (self.rotary_dim % 2 or not 0 < self.rotary_dim <= self.head_dim):
+            raise ValueError(f"rotary_dim must be even and in 1..head_dim ({self.head_dim}), got {self.rotary_dim}")
         if self.ffn not in ("mlp", "glu"):
             raise ValueError(f"ffn must be mlp or glu, got {self.ffn!r}")
         if self.norm_placement not in ("pre", "post"):
             raise ValueError(f"norm_placement must be pre or post, got {self.norm_placement!r}")
         if self.positional_encoding not in ("sinusoidal", "learned", "rope", "none"):
             raise ValueError(f"positional_encoding must be sinusoidal, learned, rope or none, got {self.positional_encoding!r}")
-        if self.positional_encoding == "rope" and self.head_dim % 2:
-            raise ValueError(f"rotary positions need an even head width, got {self.head_dim}")
+        if self.positional_encoding == "rope" and self.rotary_columns % 2:
+            raise ValueError(f"rotary positions need an even number of rotated columns, got {self.rotary_columns}")
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "TransformerConfig":
@@ -246,12 +310,15 @@ def param_shapes(cfg: TransformerConfig) -> dict[str, tuple[int, ...]]:
         tok_emb                      (V, D)
         pos_emb                      (context_length, D)   only if positional_encoding = learned
         layers.{i}.norm1.gamma/beta  (D,)                  beta only for layernorm
-        layers.{i}.attn.wq/wk/wv/wo  (D, D)                plus .bq/.bk/.bv/.bo (D,) if bias
-        layers.{i}.norm2.gamma/beta  (D,)
-        layers.{i}.ffn.w1 (F, D), .w2 (D, F)               plus .b1 (F,), .b2 (D,) if bias
-        layers.{i}.ffn.w3 (F, D)                           only if ffn = glu; plus .b3 (F,) if bias
+        layers.{i}.attn.wq           (H Dh, D)             (D, D) unless head_size is set
+        layers.{i}.attn.wk/wv        (Hkv Dh, D)           Hkv = n_kv_heads (grouped-query attention)
+        layers.{i}.attn.wo           (D, H Dh)             plus .bq/.bk/.bv if qkv_bias, .bo if out_bias
+        layers.{i}.norm2.gamma/beta  (D,)                  not with block = parallel_shared_norm
+        layers.{i}.ffn.w1 (F, D), .w2 (D, F)               plus .b1 (F,), .b2 (D,) if ffn_bias
+        layers.{i}.ffn.w3 (F, D)                           only if ffn = glu; plus .b3 (F,) if ffn_bias
         norm_f.gamma/beta            (D,)
         lm_head                      (V, D)                only if not tie_embeddings
+        lm_head_bias                 (V,)                  only if lm_head_bias
 
     Weight matrices are (D_out, D_in), the torch.nn.Linear layout that inference.linear expects.
     The feed-forward names follow llama2.c: w1 goes through the activation, w3 is the other input
@@ -270,34 +337,41 @@ def param_shapes(cfg: TransformerConfig) -> dict[str, tuple[int, ...]]:
         if cfg.norm == "layernorm":
             shapes[f"{prefix}.beta"] = (d,)
 
+    q_width, kv_width = cfg.n_heads * cfg.head_dim, cfg.kv_heads * cfg.head_dim
     for i in range(cfg.n_layers):
         p = f"layers.{i}"
         norm(f"{p}.norm1")
-        for name in ("q", "k", "v", "o"):
-            shapes[f"{p}.attn.w{name}"] = (d, d)
-            if cfg.bias:
-                shapes[f"{p}.attn.b{name}"] = (d,)
-        norm(f"{p}.norm2")
+        for name, rows in (("q", q_width), ("k", kv_width), ("v", kv_width)):
+            shapes[f"{p}.attn.w{name}"] = (rows, d)
+            if cfg.has_bias("qkv"):
+                shapes[f"{p}.attn.b{name}"] = (rows,)
+        shapes[f"{p}.attn.wo"] = (d, q_width)
+        if cfg.has_bias("out"):
+            shapes[f"{p}.attn.bo"] = (d,)
+        if cfg.block != "parallel_shared_norm":
+            norm(f"{p}.norm2")
         shapes[f"{p}.ffn.w1"] = (f, d)
-        if cfg.bias:
+        if cfg.has_bias("ffn"):
             shapes[f"{p}.ffn.b1"] = (f,)
         if cfg.ffn == "glu":
             shapes[f"{p}.ffn.w3"] = (f, d)
-            if cfg.bias:
+            if cfg.has_bias("ffn"):
                 shapes[f"{p}.ffn.b3"] = (f,)
         shapes[f"{p}.ffn.w2"] = (d, f)
-        if cfg.bias:
+        if cfg.has_bias("ffn"):
             shapes[f"{p}.ffn.b2"] = (d,)
     norm("norm_f")
     if not cfg.tie_embeddings:
         shapes["lm_head"] = (v, d)
+    if cfg.lm_head_bias:
+        shapes["lm_head_bias"] = (v,)
     return shapes
 
 
 def _is_bias(name: str) -> bool:
-    """attn.bq/bk/bv/bo and ffn.b1/b2/b3."""
+    """attn.bq/bk/bv/bo, ffn.b1/b2/b3 and lm_head_bias."""
     last = name.rsplit(".", 1)[-1]
-    return last in ("bq", "bk", "bv", "bo", "b1", "b2", "b3")
+    return last in ("bq", "bk", "bv", "bo", "b1", "b2", "b3", "lm_head_bias")
 
 
 def init_params(cfg: TransformerConfig, *, seed: int, device: str = "cpu", dtype: torch.dtype = DTYPE) -> dict[str, Tensor]:
@@ -390,7 +464,36 @@ def _rope_tables(length: int, start: int, cfg: TransformerConfig, like: Tensor) 
     and shared by every layer, like a position ROM."""
     if cfg.positional_encoding != "rope":
         return None
-    return inference.rope_tables(length, cfg.head_dim, cfg.rope_theta, start, device=like.device, dtype=like.dtype)
+    return inference.rope_tables(length, cfg.rotary_columns, cfg.rope_theta, start, device=like.device, dtype=like.dtype)
+
+
+def _rotate(fn: Callable, x: Tensor, rope: tuple[Tensor, Tensor], cfg: TransformerConfig) -> Tensor:
+    """Call the rope stage on the first cfg.rotary_columns columns of each head and pass the
+    others through unchanged (partial rotary: GPT-NeoX, Phi). With every column rotated (the
+    default) this is the rope stage itself. The split and the join are re-indexings."""
+    rd = cfg.rotary_columns
+    if rd == x.shape[-1]:
+        return fn(x, *rope)
+    return torch.cat((fn(x[..., :rd], *rope), x[..., rd:]), dim=-1)
+
+
+def _shared_kv(x: Tensor, cfg: TransformerConfig) -> Tensor:
+    """Grouped-query attention: each key/value head serves n_heads / n_kv_heads query heads, so
+    repeat it that many times, (B, Hkv, S, Dh) -> (B, H, S, Dh), as Hugging Face's repeat_kv does.
+    A re-indexing. Without grouped-query attention, x itself."""
+    if cfg.kv_heads == cfg.n_heads:
+        return x
+    return inference.repeat_kv(x, cfg.n_heads // cfg.kv_heads)
+
+
+def _attention_mask(t_query: int, t_key: int, offset: int, cfg: TransformerConfig, device: Any) -> Tensor:
+    """The causal mask, (t_query, t_key) boolean. With a sliding window, query i (at position
+    offset + i) also loses every key at least attention_window positions back, which is the causal
+    mask shifted by the window, inverted. A comparison of positions: no arithmetic on activations."""
+    mask = inference.causal_mask(t_query, t_key, offset, device=device)
+    if cfg.attention_window is not None:
+        mask = mask & ~inference.causal_mask(t_query, t_key, offset - cfg.attention_window, device=device)
+    return mask
 
 
 def _embed(params: dict, token_ids: Tensor, start: int, ops: ModelOps, cfg: TransformerConfig) -> Tensor:
@@ -398,6 +501,8 @@ def _embed(params: dict, token_ids: Tensor, start: int, ops: ModelOps, cfg: Tran
     token_ids (B, T) -> (B, T, D). Rotary positions add nothing here (they rotate q and k inside
     attention). With positional_encoding = none, order comes only from the causal mask."""
     x = ops.embedding(token_ids, params["tok_emb"])
+    if cfg.embed_scale is not None:
+        x = x * cfg.embed_scale                                  # Gemma: sqrt(d_model)
     t = token_ids.shape[1]
     if cfg.positional_encoding == "learned":
         x = x + inference.learned_positions(t, params["pos_emb"], start)
@@ -417,14 +522,16 @@ def _attention(layer: dict, params: dict, prefix: str, h: Tensor, cfg: Transform
     q = layer["qkv_proj"](h, params[f"{prefix}.wq"], params.get(f"{prefix}.bq"))   # (B, T, D)
     k = layer["qkv_proj"](h, params[f"{prefix}.wk"], params.get(f"{prefix}.bk"))
     v = layer["qkv_proj"](h, params[f"{prefix}.wv"], params.get(f"{prefix}.bv"))
-    q, k, v = (inference.split_heads(z, cfg.n_heads) for z in (q, k, v))           # (B, H, T, Dh)
+    q = inference.split_heads(q, cfg.n_heads)                                       # (B, H, T, Dh)
+    k, v = inference.split_heads(k, cfg.kv_heads), inference.split_heads(v, cfg.kv_heads)   # (B, Hkv, T, Dh)
     if rope is not None:                                                            # rotate q and k, not v
-        q, k = layer["rope"](q, *rope), layer["rope"](k, *rope)
+        q, k = _rotate(layer["rope"], q, rope, cfg), _rotate(layer["rope"], k, rope, cfg)
     offset = 0
     if cache is not None:
         offset = cache.length
-        k, v = cache.append(layer_index, k, v)                                      # (B, H, offset+T, Dh)
-    mask = inference.causal_mask(t, k.shape[2], offset, device=h.device)            # (T, offset+T)
+        k, v = cache.append(layer_index, k, v)                                      # (B, Hkv, offset+T, Dh)
+    k, v = _shared_kv(k, cfg), _shared_kv(v, cfg)                                   # (B, H, offset+T, Dh)
+    mask = _attention_mask(t, k.shape[2], offset, cfg, h.device)                    # (T, offset+T)
     s = layer["attn_scores"](q, k, mask)                                            # (B, H, T, offset+T)
     probs = layer["softmax"](s)
     a = layer["attn_values"](probs, v)                                              # (B, H, T, Dh)
@@ -448,6 +555,11 @@ def _block(i: int, x: Tensor, params: dict, ops: ModelOps, cfg: TransformerConfi
     def norm(z: Tensor, which: str) -> Tensor:
         return _norm(layer["norm"], z, params, f"{p}.{which}", cfg)
 
+    if cfg.parallel_block:                               # both branches read x (GPT-NeoX, Phi)
+        h = norm(x, "norm1")
+        attn = _attention(layer, params, f"{p}.attn", h, cfg, cache, i, rope)
+        h = h if cfg.block == "parallel_shared_norm" else norm(x, "norm2")
+        return x + (attn + _feed_forward(layer, params, f"{p}.ffn", h, cfg))
     if cfg.norm_placement == "pre":
         x = x + _attention(layer, params, f"{p}.attn", norm(x, "norm1"), cfg, cache, i, rope)
         return x + _feed_forward(layer, params, f"{p}.ffn", norm(x, "norm2"), cfg)
@@ -474,7 +586,7 @@ def _head(params: dict, x: Tensor, ops: ModelOps, cfg: TransformerConfig) -> Ten
     output weight is the token table itself, logits = x @ tok_emb^T."""
     h = _norm(ops.final_norm, x, params, "norm_f", cfg)
     weight = params["tok_emb"] if cfg.tie_embeddings else params["lm_head"]
-    return ops.lm_head(h, weight)
+    return ops.lm_head(h, weight, params.get("lm_head_bias"))
 
 
 def forward(params: dict, token_ids: Tensor, ops: ModelOps, cfg: TransformerConfig) -> Tensor:
@@ -491,7 +603,7 @@ def new_cache(params: dict, cfg: TransformerConfig, batch: int, max_len: int) ->
     """An empty KV cache for `batch` sequences of up to max_len tokens, on the parameters' device
     and dtype."""
     ref = params["tok_emb"]
-    return inference.KVCache.allocate(cfg.n_layers, batch, cfg.n_heads, max_len, cfg.head_dim,
+    return inference.KVCache.allocate(cfg.n_layers, batch, cfg.kv_heads, max_len, cfg.head_dim,
                                       device=ref.device, dtype=ref.dtype)
 
 
@@ -575,6 +687,31 @@ def _linear_backward(pair: tuple, dy: Tensor, cache: Any, w_name: str, b_name: s
     return dx
 
 
+def _rotate_forward(forward: Callable, x: Tensor, rope: tuple[Tensor, Tensor], cfg: TransformerConfig) -> tuple[Tensor, Any]:
+    """_rotate in training: rope_forward on the rotated columns, the rest passed through."""
+    rd = cfg.rotary_columns
+    if rd == x.shape[-1]:
+        return forward(x, *rope)
+    y, cache = forward(x[..., :rd], *rope)
+    return torch.cat((y, x[..., rd:]), dim=-1), cache
+
+
+def _rotate_backward(backward: Callable, dy: Tensor, cache: Any, cfg: TransformerConfig) -> Tensor:
+    """Reverse of _rotate_forward: rope_backward on the rotated columns, the rest passed through."""
+    rd = cfg.rotary_columns
+    if rd == dy.shape[-1]:
+        return backward(dy, cache)
+    return torch.cat((backward(dy[..., :rd], cache), dy[..., rd:]), dim=-1)
+
+
+def _shared_kv_backward(d: Tensor, cfg: TransformerConfig) -> Tensor:
+    """Reverse of _shared_kv: each key/value head gets the sum of the gradients of the query heads
+    that shared it, (B, H, S, Dh) -> (B, Hkv, S, Dh)."""
+    if cfg.kv_heads == cfg.n_heads:
+        return d
+    return train.repeat_kv_backward(d, cfg.n_heads // cfg.kv_heads)
+
+
 def _attention_train(layer: dict, params: dict, p: str, h: Tensor, cfg: TransformerConfig,
                      rope: tuple[Tensor, Tensor] | None) -> tuple[Tensor, dict]:
     """Attention forward with caches (no KV cache: training sees whole sequences)."""
@@ -583,14 +720,14 @@ def _attention_train(layer: dict, params: dict, p: str, h: Tensor, cfg: Transfor
     qkv = {}
     for name in ("q", "k", "v"):
         out, c[name] = layer["qkv_proj"][0](h, params[f"{p}.w{name}"], params.get(f"{p}.b{name}"))
-        qkv[name] = inference.split_heads(out, cfg.n_heads)
+        qkv[name] = inference.split_heads(out, cfg.n_heads if name == "q" else cfg.kv_heads)
     if rope is not None:
-        qkv["q"], c["rope_q"] = layer["rope"][0](qkv["q"], *rope)
-        qkv["k"], c["rope_k"] = layer["rope"][0](qkv["k"], *rope)
-    mask = inference.causal_mask(t, t, device=h.device)
-    s, c["scores"] = layer["attn_scores"][0](qkv["q"], qkv["k"], mask)
+        qkv["q"], c["rope_q"] = _rotate_forward(layer["rope"][0], qkv["q"], rope, cfg)
+        qkv["k"], c["rope_k"] = _rotate_forward(layer["rope"][0], qkv["k"], rope, cfg)
+    mask = _attention_mask(t, t, 0, cfg, h.device)
+    s, c["scores"] = layer["attn_scores"][0](qkv["q"], _shared_kv(qkv["k"], cfg), mask)
     probs, c["softmax"] = layer["softmax"][0](s)
-    a, c["values"] = layer["attn_values"][0](probs, qkv["v"])
+    a, c["values"] = layer["attn_values"][0](probs, _shared_kv(qkv["v"], cfg))
     out, c["out"] = layer["out_proj"][0](inference.merge_heads(a), params[f"{p}.wo"], params.get(f"{p}.bo"))
     return out, c
 
@@ -601,8 +738,10 @@ def _attention_backward(layer: dict, d_out: Tensor, c: dict, p: str, grads: dict
     d_probs, dv = layer["attn_values"][1](inference.split_heads(da, cfg.n_heads), c["values"])
     ds = layer["softmax"][1](d_probs, c["softmax"])
     dq, dk = layer["attn_scores"][1](ds, c["scores"])
+    dk, dv = _shared_kv_backward(dk, cfg), _shared_kv_backward(dv, cfg)   # sum over the heads sharing each
     if "rope_q" in c:                                    # undo the rotation (rope_backward)
-        dq, dk = layer["rope"][1](dq, c["rope_q"]), layer["rope"][1](dk, c["rope_k"])
+        dq = _rotate_backward(layer["rope"][1], dq, c["rope_q"], cfg)
+        dk = _rotate_backward(layer["rope"][1], dk, c["rope_k"], cfg)
     d_h = 0
     for name, d_heads in (("q", dq), ("k", dk), ("v", dv)):
         d_h = d_h + _linear_backward(layer["qkv_proj"], inference.merge_heads(d_heads), c[name],
@@ -640,6 +779,8 @@ def forward_train(params: dict, token_ids: Tensor, ops: ModelOps, cfg: Transform
         raise NotImplementedError("dropout > 0 is not wired into forward_train yet (every config uses 0.0)")
     caches: dict[str, Any] = {"T": token_ids.shape[1], "layers": []}
     x, caches["embedding"] = ops.embedding[0](token_ids, params["tok_emb"])
+    if cfg.embed_scale is not None:
+        x = x * cfg.embed_scale
     t = token_ids.shape[1]
     if cfg.positional_encoding == "learned":
         x = x + params["pos_emb"][:t]
@@ -648,7 +789,14 @@ def forward_train(params: dict, token_ids: Tensor, ops: ModelOps, cfg: Transform
     rope = _rope_tables(t, 0, cfg, x)                    # None unless rotary positions
     for i in range(cfg.n_layers):
         layer, p, c = ops.layers[i], f"layers.{i}", {}
-        if cfg.norm_placement == "pre":
+        if cfg.parallel_block:
+            h, c["norm1"] = _norm_forward(layer["norm"], x, params, f"{p}.norm1", cfg)
+            attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", h, cfg, rope)
+            if cfg.block == "parallel":
+                h, c["norm2"] = _norm_forward(layer["norm"], x, params, f"{p}.norm2", cfg)
+            ffn, c["ffn"] = _ffn_train(layer, params, f"{p}.ffn", h, cfg)
+            x = x + (attn + ffn)
+        elif cfg.norm_placement == "pre":
             h, c["norm1"] = _norm_forward(layer["norm"], x, params, f"{p}.norm1", cfg)
             attn, c["attn"] = _attention_train(layer, params, f"{p}.attn", h, cfg, rope)
             x = x + attn
@@ -663,7 +811,7 @@ def forward_train(params: dict, token_ids: Tensor, ops: ModelOps, cfg: Transform
         caches["layers"].append(c)
     h, caches["final_norm"] = _norm_forward(ops.final_norm, x, params, "norm_f", cfg)
     weight = params["tok_emb"] if cfg.tie_embeddings else params["lm_head"]
-    logits, caches["lm_head"] = ops.lm_head[0](h, weight)
+    logits, caches["lm_head"] = ops.lm_head[0](h, weight, params.get("lm_head_bias"))
     return logits, caches
 
 
@@ -671,11 +819,24 @@ def backward(d_logits: Tensor, caches: dict, ops: ModelOps, cfg: TransformerConf
     """Backpropagate d_logits through the model in reverse order. Returns {param name: gradient},
     with residual-branch gradients summed and tied-embedding gradients added together."""
     grads: dict[str, Tensor] = {}
-    dh, d_head, _ = ops.lm_head[1](d_logits, caches["lm_head"])
+    dh, d_head, d_head_bias = ops.lm_head[1](d_logits, caches["lm_head"])
+    if d_head_bias is not None:
+        grads["lm_head_bias"] = d_head_bias
     dx = _norm_backward(ops.final_norm, dh, caches["final_norm"], "norm_f", grads, cfg)
     for i in reversed(range(cfg.n_layers)):
         layer, p, c = ops.layers[i], f"layers.{i}", caches["layers"][i]
-        if cfg.norm_placement == "pre":
+        if cfg.block == "parallel":
+            # x_out = x_in + (attn(norm1 x_in) + ffn(norm2 x_in)): dx reaches x_in directly and through both.
+            d_branch = _ffn_backward(layer, dx, c["ffn"], f"{p}.ffn", grads, cfg)
+            d_ffn = _norm_backward(layer["norm"], d_branch, c["norm2"], f"{p}.norm2", grads, cfg)
+            d_branch = _attention_backward(layer, dx, c["attn"], f"{p}.attn", grads, cfg)
+            dx = dx + (_norm_backward(layer["norm"], d_branch, c["norm1"], f"{p}.norm1", grads, cfg) + d_ffn)
+        elif cfg.block == "parallel_shared_norm":
+            # x_out = x_in + (attn(h) + ffn(h)), h = norm1 x_in: h's gradient is the sum of both branches'.
+            d_h = _attention_backward(layer, dx, c["attn"], f"{p}.attn", grads, cfg)
+            d_h = d_h + _ffn_backward(layer, dx, c["ffn"], f"{p}.ffn", grads, cfg)
+            dx = dx + _norm_backward(layer["norm"], d_h, c["norm1"], f"{p}.norm1", grads, cfg)
+        elif cfg.norm_placement == "pre":
             # x_out = x_mid + ffn(norm2(x_mid)): dx reaches x_mid directly and through the branch.
             d_branch = _ffn_backward(layer, dx, c["ffn"], f"{p}.ffn", grads, cfg)
             dx = dx + _norm_backward(layer["norm"], d_branch, c["norm2"], f"{p}.norm2", grads, cfg)
@@ -688,7 +849,7 @@ def backward(d_logits: Tensor, caches: dict, ops: ModelOps, cfg: TransformerConf
             dx = d_sum + _ffn_backward(layer, d_sum, c["ffn"], f"{p}.ffn", grads, cfg)
             d_sum = _norm_backward(layer["norm"], dx, c["norm1"], f"{p}.norm1", grads, cfg)
             dx = d_sum + _attention_backward(layer, d_sum, c["attn"], f"{p}.attn", grads, cfg)
-    d_table = ops.embedding[1](dx, caches["embedding"])
+    d_table = ops.embedding[1](dx if cfg.embed_scale is None else dx * cfg.embed_scale, caches["embedding"])
     if cfg.tie_embeddings:
         grads["tok_emb"] = d_table + d_head          # used twice: input lookup and output layer
     else:

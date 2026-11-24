@@ -1,7 +1,9 @@
 """Which Hugging Face architectures our from-scratch models can run: one profile per architecture,
 each a config mapping, a weight export into our layout and a loader (reference/hf_gpt2.py,
-reference/hf_llama.py). eval/harness.py and bench/sweep.py go through here, so adding a profile
-means adding one line to PROFILES.
+reference/hf_llama.py, and reference/hf_families.py for mistral, qwen2, gemma, gpt_neox, phi and
+opt). eval/harness.py and bench/sweep.py go through here, so adding a profile means adding one line
+to PROFILES. reference/inspect_model.py lists what a model without a profile (or with settings a
+profile refuses) uses that our stages don't model yet.
 
 The Hugging Face model itself is imported and never modified; these functions only read its
 config and state dict.
@@ -16,7 +18,7 @@ import torch
 from torch import Tensor
 
 from baseline import host
-from reference import hf_gpt2, hf_llama
+from reference import hf_families, hf_gpt2, hf_llama
 from reference.local_cache import CHECKPOINT_DIR
 
 
@@ -30,6 +32,8 @@ class Profile(NamedTuple):
 PROFILES: dict[str, Profile] = {
     "gpt2": Profile(hf_gpt2.gpt2_config_from_hf, hf_gpt2.gpt2_params_from_hf, hf_gpt2.load_gpt2),
     "llama": Profile(hf_llama.llama_config_from_hf, hf_llama.llama_params_from_hf, hf_llama.load_llama),
+    **{model_type: Profile(family.config_from_hf, family.params_from_hf, family.load)
+       for model_type, family in hf_families.FAMILIES.items() if model_type != "llama"},
 }
 
 

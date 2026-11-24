@@ -384,3 +384,34 @@ def sample_next_token(logits: Tensor, temperature: float = 1.0, top_k: int | Non
     idx = (c <= u).sum(dim=-1)
     # If rounding leaves c[-1] slightly below u, idx would be V; clamp to the last index.
     return idx.clamp(max=p.shape[-1] - 1)
+
+
+# ----------------------------------------------------------------------------------------------
+# Additions for other model families (2026-11-24): exact GELU, shared key/value heads
+# ----------------------------------------------------------------------------------------------
+
+# 1 / sqrt(2), for Phi(x) = 0.5 (1 + erf(x / sqrt(2))).
+_INV_SQRT2 = 1.0 / math.sqrt(2.0)
+
+
+def gelu_exact(x: Tensor) -> Tensor:
+    """GELU in its exact form: y = x * Phi(x) = 0.5 x (1 + erf(x / sqrt(2))), elementwise, with Phi
+    the standard normal CDF. GPT-NeoX (Pythia) and BERT use this form (Hugging Face's "gelu",
+    torch's F.gelu with no approximation); GPT-2 and Phi use the tanh form, `gelu` above. Once the
+    input is quantized to b bits either one is a 2^b-entry table.
+    """
+    return 0.5 * x * (1.0 + torch.erf(x * _INV_SQRT2))
+
+
+def repeat_kv(x: Tensor, n_rep: int) -> Tensor:
+    """Grouped-query attention's sharing of key/value heads: (B, Hkv, S, Dh) -> (B, Hkv * n_rep, S, Dh),
+    where output head j is input head j // n_rep (Hugging Face's repeat_kv, the same order).
+
+    Each key/value head serves n_rep consecutive query heads. This is a re-indexing, no arithmetic:
+    in hardware the n_rep query heads of a group read the same stored keys and values, which is
+    why the KV cache holds only Hkv heads. n_rep = 1 (ordinary multi-head attention) returns x.
+    """
+    if n_rep == 1:
+        return x
+    b, h_kv, s, dh = x.shape
+    return x[:, :, None, :, :].expand(b, h_kv, n_rep, s, dh).reshape(b, h_kv * n_rep, s, dh)

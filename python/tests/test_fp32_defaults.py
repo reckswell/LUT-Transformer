@@ -37,7 +37,8 @@ def _all_f32(tensors) -> bool:
 
 def test_dtype_settings_are_float32():
     assert base.DTYPE == F32 and lut_host.DTYPE == F32
-    assert all(stage.quant is None and stage.lut is None for stage in lut_host.parameter_toggles().values())
+    toggles = lut_host.parameter_toggles()
+    assert all(toggles[stage].is_base() for stage in base.STAGES) and toggles["kv_cache"].is_base()
 
 
 def test_baseline_default_run_is_float32():
