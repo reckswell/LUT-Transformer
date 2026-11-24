@@ -1,0 +1,23 @@
+# FP32 base metrics for stories15M on the GPU, three arms (hf, baseline, lut all_base). 2026-11-23.
+# Untracked on purpose (the coordinator's brief); copy it into git only with Alpha's OK.
+#
+# Two invocations, from python/, with the benchmarking folders (models, data, timing history) from env:
+#   B=../../LUT-Transformer-local/benchmarking
+#   export LUT_LOCAL_DIR=$B LUT_CHECKPOINT_DIR=$B/models HF_HOME=$B/hf-home LUT_DATASET_DIR=$B/datasets
+#   1. speed + full-span perplexity (the dataset's default 1,200,000 characters, 321,526 scored tokens):
+#        python -m bench.sweep --csv configs/sweep/base_metrics_stories15m.csv --no-power
+#   2. the screening slice (187,000 characters = 50,212 stories15M tokens, 50,211 scored, 392 windows):
+#        python -m bench.sweep --csv configs/sweep/base_metrics_stories15m.csv --no-power --max-eval-chars 187000 \
+#          --only s15m_hf_slice_gpu,s15m_base_slice_gpu,s15m_lut_allbase_slice_gpu
+# The slice rows are enabled=no so a plain run never measures them at the wrong character limit
+# (--max-eval-chars is sweep-wide, so the two spans can't share one invocation).
+# --no-power: no power or energy numbers until the power-ramp fix (agent/STATE.md, Next item 6).
+# speed: batch 1, prompt lengths 32/64/128/224 (stories15M was trained with a 256-token context, and
+# 224 + 32 decode tokens = 256), 32 decode tokens, 10 timed repeats after 2 untimed ones.
+enabled,name,arm,model,weights,lut_preset,device,benchmarks,datasets,batch,context_lengths,decode_tokens,repeats,notes
+yes,s15m_hf_gpu,hf,stories15m,pretrained,,cuda,speed;perplexity,tinystories,1,32;64;128;224,32,10,Hugging Face LlamaForCausalLM as transformers ships it; FP32 with TF32 off; full span
+yes,s15m_base_gpu,baseline,stories15m,pretrained,,cuda,speed;perplexity,tinystories,1,32;64;128;224,32,10,our from-scratch model (Llama profile); full span
+yes,s15m_lut_allbase_gpu,lut,stories15m,pretrained,all_base,cuda,speed;perplexity,tinystories,1,32;64;128;224,32,10,LUT wiring with every stage on BASE (control: perplexity must equal s15m_base_gpu exactly); full span
+no,s15m_hf_slice_gpu,hf,stories15m,pretrained,,cuda,perplexity,tinystories,,,,,screening slice: run with --max-eval-chars 187000 (see the header)
+no,s15m_base_slice_gpu,baseline,stories15m,pretrained,,cuda,perplexity,tinystories,,,,,screening slice: run with --max-eval-chars 187000
+no,s15m_lut_allbase_slice_gpu,lut,stories15m,pretrained,all_base,cuda,perplexity,tinystories,,,,,screening slice: run with --max-eval-chars 187000; must equal s15m_base_slice_gpu exactly

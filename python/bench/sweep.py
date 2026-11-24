@@ -162,7 +162,9 @@ import torch
 from torch import Tensor
 
 from baseline import host as base
+from bench import resources
 from bench.progress import WeightedBar, format_seconds, write
+from bench.resources import warm_up_until_steady
 from bench.runlog import REPO_ROOT, Run
 from bench.telemetry import PowerMonitor
 from bench.timing import _synchronize, summarize
@@ -925,10 +927,13 @@ def measure_perplexity(forward: Callable[[Tensor], Tensor], tokens: Tensor, *, w
     """Sliding-window perplexity of tokens (N,): windows [b, b + W) for b = 0, S, 2S, ... until one
     reaches the end. In each window, the logits at position t - 1 score token t for every t the
     earlier windows didn't reach (t >= 1), so each token after the first is scored exactly once, with
-    the window's earlier tokens as context. Loss in float64: logsumexp(z) - z[target].
+    the window's earlier tokens as context. Loss in float64: logsumexp(z) - z[target]. Accuracy over
+    the same scored tokens: top-1 = the true next token is the argmax, top-5 = it is among the 5 most
+    likely (ties broken by torch.topk).
     after_window(i) runs after window i is scored (progress updates)."""
     n = tokens.numel()
     nll, scored, windows, prev_end, begin = 0.0, 0, 0, 0, 0
+    top1 = top5 = 0                 # next-token accuracy: the true token is the argmax / in the top 5
     window_s: list[float] = []
     forward_ms: list[float] = []
     started = time.perf_counter()
@@ -944,6 +949,9 @@ def measure_perplexity(forward: Callable[[Tensor], Tensor], tokens: Tensor, *, w
         targets = tokens[first:end].to(device)
         z = logits[0, first - 1 - begin:end - 1 - begin].double()
         nll += float((torch.logsumexp(z, dim=-1) - z.gather(-1, targets[:, None])[:, 0]).sum())
+        best5 = z.topk(5, dim=-1).indices                                  # (scored, 5), best first
+        top1 += int((best5[:, 0] == targets).sum())
+        top5 += int((best5 == targets[:, None]).any(dim=-1).sum())
         scored += end - first
         windows += 1
         window_s.append(time.perf_counter() - step_start)
@@ -954,6 +962,7 @@ def measure_perplexity(forward: Callable[[Tensor], Tensor], tokens: Tensor, *, w
             break
         prev_end, begin = end, begin + stride
     return {"perplexity": math.exp(nll / scored), "nll_per_token": nll / scored, "nll_total": nll, "eval_tokens": n,
+            "top1_accuracy": top1 / scored, "top5_accuracy": top5 / scored, "top1_correct": top1, "top5_correct": top5,
             "scored_tokens": scored, "eval_window": window, "eval_stride": stride, "eval_windows": windows,
             "eval_s": time.perf_counter() - started, "forward_ms_median": statistics.median(forward_ms),
             "window_s_median": statistics.median(window_s)}
@@ -1076,16 +1085,22 @@ def measure_idle(targets: set[str], seconds: float) -> dict[str, dict[str, Any]]
     return out
 
 
+GPU_SETTINGS: dict[str, Any] = {}  # resources.gpu_settings() for the sweep's GPU (main fills it)
+POWER_SETTLE_TOLERANCE = 0.03      # warm-up continues until 3 power readings agree within 3% ...
+POWER_MAX_WARMUP_S = 10.0          # ... or this many seconds (bench/resources.py warm_up_until_steady)
+LAST_WARMUP: dict[str, Any] = {}   # the last power window's warm-up record (length, calls, settled)
+
+
 def power_window(fn: Callable[[], Any], device: str, target: str, *, seconds: float,
                  warmup_s: float, note: str) -> tuple[dict[str, Any], int, int]:
-    """Run fn() back to back for warmup_s unsampled, then for `seconds` while power is sampled.
+    """Run fn() back to back unsampled for at least warmup_s and until GPU power is steady (three
+    readings within POWER_SETTLE_TOLERANCE), then for `seconds` while power is sampled.
     Returns (PowerMonitor report, calls in the sampled part, calls in the warm-up)."""
-    warm_calls = 0
-    deadline = time.perf_counter() + warmup_s
-    while time.perf_counter() < deadline:
-        fn()
-        _synchronize(device)
-        warm_calls += 1
+    warm = warm_up_until_steady(fn, lambda: _synchronize(device), min_s=warmup_s, device=device,
+                                tolerance=POWER_SETTLE_TOLERANCE, max_s=max(warmup_s, POWER_MAX_WARMUP_S))
+    warm_calls = warm["warmup_calls"]
+    LAST_WARMUP.clear()
+    LAST_WARMUP.update(warm)
     monitor = PowerMonitor(target=target, enabled=True, note=note)
     monitor.start()
     calls = 0
@@ -1411,6 +1426,19 @@ PERPLEXITY_METRICS = {
     "perplexity": "per token", "nll_total": "nats", "nll_per_token": "nats/token", "eval_tokens": "tokens",
     "eval_chars": "chars", "eval_bytes": "bytes", "eval_words": "words", "bits_per_byte": "bits/byte",
     "word_perplexity": "per word", "eval_windows": "windows", "eval_s": "s", "forward_ms_median": "ms",
+    "top1_accuracy": "fraction of scored tokens", "top5_accuracy": "fraction of scored tokens",
+}
+# Resource use per phase (bench/resources.py ResourceSampler.summary), benchmark = "resources" in the
+# long format, dataset = the phase (speed, or the perplexity dataset's name)
+RESOURCE_METRICS = {
+    "window_s": "s", "power_draw_mean": "W", "power_draw_max": "W", "power_w_mean_steady": "W",
+    "power_draw_instant_mean": "W", "power_draw_instant_max": "W", "energy_j": "J", "energy_per_token_mj": "mJ/token",
+    "utilization_gpu_mean": "%", "utilization_gpu_max": "%", "utilization_memory_mean": "%",
+    "utilization_memory_max": "%", "memory_used_max": "MiB", "torch_peak_allocated_mib": "MiB",
+    "torch_peak_reserved_mib": "MiB", "clocks_sm_mean": "MHz", "clocks_sm_max": "MHz", "clocks_mem_mean": "MHz",
+    "temperature_gpu_max": "C", "throttled": "yes/no", "clock_event_reasons_seen": "names", "pstates_seen": "P-states",
+    "process_cpu_user_s": "s", "process_cpu_system_s": "s", "process_cpu_cores_mean": "cores",
+    "host_cpu_busy_pct": "%", "process_rss_peak_mib": "MiB", "gpu_samples": "samples", "interval_ms": "ms",
 }
 METRIC_NOTES = {
     "perplexity": "token perplexity depends on the tokenizer; compare models with bits_per_byte or word_perplexity",
@@ -1490,6 +1518,8 @@ def _measure_speed(row: Row, runner: Any, loaded: Loaded, entry: PlanEntry, sett
                     note=f"{row.name} {phase} T={length}")
                 run.save_power(report, window=f"{phase}_T{length}")
                 stats["power"][phase] = {"calls": calls, "warmup_calls": warm_calls,
+                                         "warmup_s": LAST_WARMUP.get("warmup_s"),
+                                         "warmup_settled": LAST_WARMUP.get("settled"),
                                          **power_numbers(report, calls * tokens_per_call)}
                 inner.advance(power_window_s(settings), items=1)
                 account(power_window_s(settings))
@@ -1583,9 +1613,22 @@ def run_row(entry: PlanEntry, settings: Settings, models: ModelCache, idle: dict
     inner = WeightedBar(max(inner_total, 1e-3), speed_steps + window_steps, label=row.name,
                         unit="steps", show=settings.show_progress, position=1, leave=False)
     try:
-        per_context = (_measure_speed(row, runner, loaded, entry, settings, run, inner, account,
-                                      inner_total / max(1, inner.count)) if row.runs_speed else {})
-        per_dataset = _measure_perplexity(row, runner, loaded, entry, settings, run, inner, account)
+        per_resources: dict[str, dict[str, Any]] = {}
+        if row.runs_speed:
+            with resources.ResourceSampler(row.device) as sampler:
+                per_context = _measure_speed(row, runner, loaded, entry, settings, run, inner, account,
+                                             inner_total / max(1, inner.count))
+            per_resources["speed"] = sampler.summary()
+        else:
+            per_context = {}
+        with resources.ResourceSampler(row.device) as sampler:
+            per_dataset = _measure_perplexity(row, runner, loaded, entry, settings, run, inner, account)
+        if per_dataset:
+            scored = sum(s["scored_tokens"] for s in per_dataset.values())
+            per_resources["perplexity"] = sampler.summary(tokens=scored)
+            if len(per_dataset) == 1:      # one dataset: its own phase name
+                per_resources[next(iter(per_dataset))] = per_resources.pop("perplexity")
+        run.log(kind="resources", phases=per_resources)
     finally:
         inner.close()
     row_s = time.perf_counter() - row_start
@@ -1603,7 +1646,11 @@ def run_row(entry: PlanEntry, settings: Settings, models: ModelCache, idle: dict
         else idle_info.get("reason"),
         **{f"T{length}": stats for length, stats in per_context.items()},
         **{f"perplexity_{name}": stats for name, stats in per_dataset.items()},
+        **{f"resources_{phase}": stats for phase, stats in per_resources.items()},
+        "gpu_settings": {k: v for k, v in GPU_SETTINGS.items() if k != "raw_q"},
     }
+    if GPU_SETTINGS.get("raw_q"):
+        (run.dir / "gpu_settings.txt").write_text(GPU_SETTINGS["raw_q"], encoding="utf-8")
     run_dir = run.finish(summary)
     account(budget)                    # top up to the row's planned share
     outer.advance(0.0, items=1)
@@ -1636,9 +1683,19 @@ def run_row(entry: PlanEntry, settings: Settings, models: ModelCache, idle: dict
         line = {**common, "benchmark": "perplexity", "dataset": name, "batch": 1,
                 **{k: stats[k] for k in ("perplexity", "nll_per_token", "nll_total", "eval_chars", "eval_bytes",
                                          "eval_words", "bits_per_byte", "word_perplexity", "dataset_sha256",
-                                         "eval_window", "eval_stride", "eval_windows", "eval_s", "forward_ms_median")},
-                "eval_tokens": stats["scored_tokens"], "power_note": "no power measured for perplexity"}
+                                         "eval_window", "eval_stride", "eval_windows", "eval_s", "forward_ms_median",
+                                         "top1_accuracy", "top5_accuracy")},
+                "eval_tokens": stats["scored_tokens"],
+                "power_note": "GPU power sampled through the eval (resources lines, ResourceSampler)"
+                if name in per_resources else "no power measured for perplexity"}
         lines.append({k: _round(v) for k, v in line.items()})
+    resource_lines = []                    # GPU and host resource use per phase: long format and summary.json only
+    for phase, stats in per_resources.items():
+        line = {**common, "benchmark": "resources", "dataset": phase, "batch": row.batch if phase == "speed" else 1,
+                **{k: stats.get(k) for k in RESOURCE_METRICS}}
+        line["power_note"] = ("nvidia-smi power.draw (driver-averaged ~1 s) sampled through the phase; "
+                              "power_w_mean_steady leaves out its first second")
+        resource_lines.append({k: _round(v) for k, v in line.items()})
 
     timed_speed_s = sum((settings.warmup + row.repeats) * ((s["prefill_ms_median"] + row.decode_tokens *
                                                             s.get("decode_ms_per_token_median", 0.0)) / 1000.0)
@@ -1654,7 +1711,7 @@ def run_row(entry: PlanEntry, settings: Settings, models: ModelCache, idle: dict
               "perplexity": {name: {"window_s": s["window_s_median"], "windows": s["eval_windows"],
                                     "tokenize_s": s["tokenize_s"], "window": s["eval_window"],
                                     "limit": char_limit(name, settings)} for name, s in per_dataset.items()}}
-    record["long"] = long_rows(lines, run, toggle_string(row, loaded))
+    record["long"] = long_rows(lines + resource_lines, run, toggle_string(row, loaded))
     return lines, record
 
 
@@ -1687,6 +1744,7 @@ def long_rows(lines: list[dict[str, Any]], run: Run, toggles: str) -> list[dict[
     out = []
     for line in lines:
         speed = line["benchmark"] == "speed"
+        res = line["benchmark"] == "resources"
         common = {
             "timestamp_utc": stamp, "sweep_id": line["sweep_id"], "run_id": line["run_id"], "git_commit": commit,
             "row": line["row"], "model": line["model"], "arm": line["arm"], "weights": line["weights"],
@@ -1696,15 +1754,18 @@ def long_rows(lines: list[dict[str, Any]], run: Run, toggles: str) -> list[dict[
             "context_tokens": line.get("context", "") if speed else "", "batch": line.get("batch", ""),
             "decode_tokens": line.get("decode_tokens", "") if speed else "",
             "repeats": line.get("repeats", "") if speed else "",
-            "eval_window_tokens": "" if speed else line.get("eval_window", ""),
-            "eval_stride_tokens": "" if speed else line.get("eval_stride", ""),
+            "eval_window_tokens": "" if speed or res else line.get("eval_window", ""),
+            "eval_stride_tokens": "" if speed or res else line.get("eval_stride", ""),
         }
-        for metric, unit in (SPEED_METRICS if speed else PERPLEXITY_METRICS).items():
+        metrics = SPEED_METRICS if speed else RESOURCE_METRICS if res else PERPLEXITY_METRICS
+        for metric, unit in metrics.items():
             value = line.get(metric)
             if value is None or value == "":
                 continue
             note = METRIC_NOTES.get(metric, "")
-            if metric.endswith("power_w") or metric.endswith("_mj"):
+            if res:
+                note = line.get("power_note", "") if "power" in metric or "energy" in metric else ""
+            elif metric.endswith("power_w") or metric.endswith("_mj"):
                 note = line.get("power_source") or ""
             out.append({**common, "metric": metric, "value": value, "unit": unit, "note": note})
     return out
@@ -1896,6 +1957,12 @@ def main(argv: list[str] | None = None) -> int:
         spec = data.DATASETS[name]
         write(f"downloading {name} from {spec.hf_repo} into {data.DATASET_DIR / name}")
         data.download(spec)
+
+    # The GPU's power and clock settings, once per sweep, recorded in every row's summary (raw text in
+    # the first run folder's gpu_settings.txt).
+    GPU_SETTINGS.clear()
+    if any(row.device.startswith("cuda") for row in run_rows):
+        GPU_SETTINGS.update(resources.gpu_settings(next(r.device for r in run_rows if r.device.startswith("cuda"))))
 
     # Idle power first, before any model or CUDA context exists. A dry run only checks which power
     # sources can be read (a short sample, not recorded).

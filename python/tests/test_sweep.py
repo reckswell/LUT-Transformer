@@ -260,8 +260,13 @@ def test_tiny_sweep_end_to_end_on_the_cpu(tmp_path, capsys):
     assert set(summary["T8"]) >= {"prefill_ms_median", "decode_ms_per_token_median", "decode_tokens_per_s"}
     meta = json.loads((runs[0] / "meta.json").read_text())
     assert meta["notes"] == "first row" and meta["configs"]["row"]["context_lengths"] == [8, 16]
-    contexts = [json.loads(line) for line in (runs[0] / "metrics.jsonl").read_text().splitlines()]
+    records_jsonl = [json.loads(line) for line in (runs[0] / "metrics.jsonl").read_text().splitlines()]
+    contexts = [r for r in records_jsonl if r.get("kind") == "speed"]
     assert [len(c["prefill_ms"]) for c in contexts] == [2, 2] and [len(c["decode_ms"]) for c in contexts] == [4, 4]
+    # resource use per phase (bench/resources.py): host CPU time always, GPU readings only on cuda rows
+    (res,) = [r for r in records_jsonl if r.get("kind") == "resources"]
+    assert res["phases"]["speed"]["process_cpu_user_s"] >= 0 and res["phases"]["speed"]["window_s"] > 0
+    assert "resources_speed" in summary and "power_draw_mean" not in summary["resources_speed"]
 
     records = [json.loads(line) for line in history.read_text().splitlines()]
     assert [r["key"]["arm"] for r in records] == ["baseline", "lut"]
@@ -683,3 +688,25 @@ def test_stories15m_baseline_and_lut_speed_rows_through_the_sweep(tmp_path):
         [("baseline", "Xenova/llama2.c-stories15M", "8"), ("baseline", "Xenova/llama2.c-stories15M", "16"),
          ("lut", "Xenova/llama2.c-stories15M", "8")]
     assert all(float(l["decode_ms_per_token_median"]) > 0 for l in lines)
+
+
+def test_top1_and_top5_accuracy_over_the_scored_tokens():
+    """Accuracy uses the same windows and scored tokens as the NLL: top-1 = the true next token is
+    the argmax, top-5 = it is among the 5 largest logits."""
+    vocab = 7
+    tokens = torch.arange(300) % vocab
+
+    def ranked(rank):                 # the true next token gets the rank-th largest logit (0 = best)
+        def forward(x):
+            out = torch.zeros(1, x.shape[1], vocab)
+            for i in range(vocab):    # logits 6, 5, ..., 0 for tokens shifted by rank
+                out[0, torch.arange(x.shape[1]), (x[0] + 1 + i - rank) % vocab] = float(vocab - 1 - i)
+            return out
+        return forward
+
+    best = sweep.measure_perplexity(ranked(0), tokens, window=128, stride=64, device="cpu")
+    assert best["top1_accuracy"] == 1.0 and best["top5_accuracy"] == 1.0 and best["top1_correct"] == 299
+    fourth = sweep.measure_perplexity(ranked(3), tokens, window=128, stride=64, device="cpu")
+    assert fourth["top1_accuracy"] == 0.0 and fourth["top5_accuracy"] == 1.0
+    sixth = sweep.measure_perplexity(ranked(5), tokens, window=128, stride=64, device="cpu")
+    assert sixth["top1_accuracy"] == 0.0 and sixth["top5_accuracy"] == 0.0 and sixth["scored_tokens"] == 299

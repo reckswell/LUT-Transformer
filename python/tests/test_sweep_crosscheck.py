@@ -241,9 +241,15 @@ def test_long_csv_schema_on_a_tiny_cpu_sweep(tmp_path):
         reader = csv.DictReader(handle)
         assert reader.fieldnames == list(sweep.LONG_COLUMNS)
         long = list(reader)
-    keys = [(line["row"], line["context_tokens"], line["metric"]) for line in long]
-    assert len(keys) == len(set(keys))                                  # one line per row, context and metric
+    keys = [(line["row"], line["benchmark"], line["context_tokens"], line["metric"]) for line in long]
+    assert len(keys) == len(set(keys))                    # one line per row, benchmark, context and metric
     assert {line["row"] for line in long} == {"tiny_lut", "tiny_base"}
+    res = [line for line in long if line["benchmark"] == "resources"]
+    assert {(line["row"], line["dataset"]) for line in res} == {("tiny_lut", "speed"), ("tiny_base", "speed")}
+    for line in res:                                      # per-phase resource use, each with its unit
+        assert line["unit"] == sweep.RESOURCE_METRICS[line["metric"]] and line["context_tokens"] == ""
+    assert {"process_cpu_user_s", "window_s"} <= {line["metric"] for line in res}
+    long = [line for line in long if line["benchmark"] == "speed"]
     assert {(line["row"], line["context_tokens"]) for line in long} == {("tiny_lut", "8"), ("tiny_base", "8"),
                                                                         ("tiny_base", "16")}
     for line in long:
@@ -253,7 +259,7 @@ def test_long_csv_schema_on_a_tiny_cpu_sweep(tmp_path):
     # No power on this run, so no power metrics, rather than blank values
     assert not any(line["metric"].endswith("power_w") for line in long)
     with open(results / "all_results.csv", newline="", encoding="utf-8") as handle:
-        assert len(list(csv.DictReader(handle))) == len(long)
+        assert len(list(csv.DictReader(handle))) == len(long) + len(res)
 
 
 def test_cumulative_csv_appends_and_never_repeats_a_run_id(tmp_path):
