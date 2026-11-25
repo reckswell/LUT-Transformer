@@ -6,13 +6,17 @@ papers/text/
 # Datasets, checkpoints and large artifacts
 data/
 checkpoints/
+# The repository's checkpoints can be a symlink to a folder outside it (on alpha-pc:
+# ../LUT-Transformer-local/checkpoints). A pattern ending in "/" only matches real directories,
+# so this one covers the symlink.
+/checkpoints
 *.pt
 *.pth
 *.safetensors
 *.ckpt
 
 # Raw power samples can be large; summaries and metrics are committed.
-results/runs/*/power_samples.json
+results/runs/*/power_samples*.json
 
 # Python
 __pycache__/

@@ -29,9 +29,10 @@ def _is_lut(fn, lut_fn):
 
 
 def test_all_base_matches_the_baseline_model():
-    for preset in ("all_base", "toggles"):
+    for preset in ("all_base", "parameters"):
         for mode in ("inference", "train"):
-            assert lut_host.lut_ops(CFG, mode, lut_host.PRESETS[preset]) == base.base_ops(CFG, mode)
+            assert lut_host.lut_ops(CFG, mode, lut_host.preset_toggles(preset)) == base.base_ops(CFG, mode)
+    assert lut_host.lut_ops(CFG, "inference") == base.base_ops(CFG, "inference")   # the PARAMETERS defaults
     ops = base.base_ops(CFG, "inference")
     assert ops.layers[0]["qkv_proj"] is inference.linear and ops.layers[3]["ffn_act"] is inference.relu
     assert ops.final_norm is inference.layernorm and ops.lm_head is inference.linear
@@ -74,12 +75,12 @@ def test_bad_toggles_fail_at_startup(dummy_arch):
         ops_registry.resolve_ops({"softmax": Stage(lut=LUTArch("typo", 1, 8, 16))}, CFG, "inference")
     with pytest.raises(ValueError, match="out of range"):
         ops_registry.resolve_ops({"softmax": Stage(lut=DUMMY, layers=(4,))}, CFG, "inference")
-    with pytest.raises(NotImplementedError, match="D4"):
+    with pytest.raises(ValueError, match="needs calibrated ranges"):    # a static scale with no CALIBRATION
         ops_registry.resolve_ops({"qkv_proj": Stage(quant=QuantSpec(bits=8))}, CFG, "inference")
 
 
 def test_toggles_list_every_stage_and_describe_reports_table_size(dummy_arch):
-    assert set(lut_host.TOGGLES) == set(base.STAGES)
+    assert set(lut_host.parameter_toggles()) == set(base.STAGES) | {"kv_cache"}
     rows = {row["stage"]: row for row in ops_registry.describe({"ffn_up": Stage(lut=DUMMY, layers=(0,))}, CFG)}
     assert rows["ffn_up"]["runs"] == "lut:dummy" and rows["ffn_up"]["table_bits"] == "4,096"
     assert rows["ffn_up"]["layers"] == "0" and rows["ffn_down"]["runs"] == "base:linear"
@@ -87,7 +88,7 @@ def test_toggles_list_every_stage_and_describe_reports_table_size(dummy_arch):
 
 
 def test_repository_configs_load():
-    cfg, hw = base.load_configs(base.PYTHON_DIR / "configs/model/tiny.yaml", base.PYTHON_DIR / "configs/hw/gpu.yaml")
+    cfg, hw = base.load_configs(base.PYTHON_DIR / "configs/model/core.yaml", base.PYTHON_DIR / "configs/hw/gpu.yaml")
     assert cfg.head_dim * cfg.n_heads == cfg.d_model and hw["devices"]["decode"] == "cuda"
 
 

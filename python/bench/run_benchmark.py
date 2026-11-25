@@ -7,8 +7,8 @@ power telemetry and run logging work on this machine before the model is built.
     python -m bench.run_benchmark --workload matmul --device cuda --size 4096 --power
     python -m bench.run_benchmark --workload matmul --device cpu --size 1024 --power
 
-The `model` workload (prefill and decode of the from-scratch transformer for a given variant
-and hardware config) is added in window 1, once baseline/host.py and LUT/host.py can run inference.
+Prefill and decode of the models themselves (Hugging Face, baseline and LUT arms, one or many at
+once) are benchmarked by bench/sweep.py, from the list in configs/sweep/models.csv.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Any, Callable
 from bench.runlog import Run
 from bench.telemetry import PowerMonitor
 from bench.timing import time_fn
+from common import precision
 
 
 def _matmul_workload(device: str, size: int, dtype_name: str) -> tuple[Callable[[], Any], dict[str, Any]]:
@@ -73,7 +74,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--workload", choices=["matmul", "model"], default="matmul")
     parser.add_argument("--device", default="cpu", help="cpu, cuda, or cuda:N")
     parser.add_argument("--size", type=int, default=2048, help="matrix size for the matmul workload")
-    parser.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"])
+    parser.add_argument("--dtype", default="float32", choices=["float32", "float16", "bfloat16"],
+                        help="float32 (default) is the base metric; the half-precision choices exist only "
+                        "for this hardware smoke test and never reach the model")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--power", action="store_true", help="also measure power and energy")
@@ -93,6 +96,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.workload == "model":
         raise SystemExit("The model workload is added in window 1.")
+    precision.full_fp32()   # no TF32: float32 means full float32; recorded in meta.json by Run below
 
     name = args.name or f"{args.workload}_{args.device.replace(':', '')}_{args.size}_{args.dtype}"
     run = Run(
