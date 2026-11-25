@@ -397,12 +397,16 @@ def test_calibration_file_feeds_static_scales(monkeypatch, passthrough, tmp_path
 # 5. Bad settings fail when the model is built
 # ----------------------------------------------------------------------------------------------
 
-def test_pending_techniques_fail_at_startup():
+def test_pending_techniques_fail_at_startup(monkeypatch):
+    # The techniques are written (D4); one put back to @pending must stop the model being built.
     cfg = base.TransformerConfig(vocab_size=37, n_layers=2)
-    for toggles in ({"qkv_proj": Stage(quant=DYN8)}, {"lm_head": Stage(weight=W8)},
-                    {"kv_cache": KVStore(k=DYN8)}):
+    for name, toggles in (("quantize_input", {"qkv_proj": Stage(quant=DYN8)}),
+                          ("prepare_weight", {"lm_head": Stage(weight=W8)}),
+                          ("kv_encode", {"kv_cache": KVStore(k=DYN8)})):
+        monkeypatch.setattr(techniques, name, techniques.pending("D4")(lambda *a: None))
         with pytest.raises(NotImplementedError, match="pending Alpha \\(decision D4\\)"):
             lut_host.lut_ops(cfg, "inference", toggles)
+        monkeypatch.undo()
 
 
 @pytest.mark.parametrize("toggles, message", [

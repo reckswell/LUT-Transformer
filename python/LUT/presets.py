@@ -53,7 +53,9 @@ FP16 = QuantSpec(bits=16, kind="float", exp_bits=5, scale_mode="none")
 
 # Sweep templates: only bits changes from point to point.
 SWEEP_WEIGHT = W8
-SWEEP_INPUT = QuantSpec(bits=8, acc_bits=32)                                  # D4; max |x| (the percentile is not decided)
+# No acc_bits on the sweep's inputs: each point quantizes one operand and leaves the other float,
+# so the stage runs in float (an accumulator width needs every input in an integer format).
+SWEEP_INPUT = QuantSpec(bits=8)                                               # D4 per tensor; max |x| (the percentile is not decided)
 SWEEP_PROBS = replace(SWEEP_INPUT, signed=False)                              # P is in [0, 1]: unsigned (not a D4 decision)
 SWEEP_KV = QuantSpec(bits=8)                                                  # per tensor, static: D4 says nothing about the KV cache
 WEIGHT_BITS = INPUT_BITS = (8, 6, 4)
@@ -95,8 +97,6 @@ def sweep_presets(weight: QuantSpec = SWEEP_WEIGHT, inputs: QuantSpec = SWEEP_IN
             out[f"sweep_a{bits}_{stage}"] = {stage: Stage(quant=replace(inputs, bits=bits))}
     for operand, (stage, slot) in ATTENTION_OPERANDS.items():
         template = probs if operand == "p" else inputs
-        if slot == "quant_b":
-            template = replace(template, acc_bits=None)        # the accumulator width goes on the first operand
         for bits in INPUT_BITS:
             out[f"sweep_{operand}{bits}"] = {stage: Stage(**{slot: replace(template, bits=bits)})}
     for which in ("k", "v"):

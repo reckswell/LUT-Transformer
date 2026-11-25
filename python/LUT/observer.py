@@ -164,8 +164,41 @@ class Observer:
 
 
 def load(path: str | Path) -> dict[str, Ranges]:
-    """Ranges saved by Observer.save, keyed by site."""
+    """Ranges saved by Observer.save, keyed by site. Also reads the precision benchmarks'
+    activation-range files (act_amax_<model>.json, see from_weight_amax), so their calibration can
+    be reused as is."""
     data = json.loads(Path(path).read_text())
+    if "act_amax_max" in data:
+        return from_weight_amax(data)
     if data.get("format") != FORMAT:
         raise ValueError(f"{path} is not a {FORMAT} file")
     return {k: Ranges.from_dict(v) for k, v in data["sites"].items()}
+
+
+# The benchmarking copies key a matmul input by the weight it multiplies; q, k and v share one input
+# (so do w1 and w3), and tok_emb's entry is the output layer's input.
+_WEIGHT_SITE = {"attn.wq": "qkv_proj", "attn.wk": "qkv_proj", "attn.wv": "qkv_proj", "attn.wo": "out_proj",
+                "ffn.w1": "ffn_up", "ffn.w3": "ffn_up", "ffn.w2": "ffn_down"}
+
+
+def from_weight_amax(data: dict[str, Any]) -> dict[str, Ranges]:
+    """Ranges from the precision benchmarks' calibration file (benchmarking/pytorch/precision/
+    act_amax_<model>.json): per weight name, the input's max |x| (act_amax_max) and 99.99th
+    percentile of |x| (act_amax_p99_99), recorded on train-split text. They become the absmax and
+    the saved 99.99 percentile of the linear stages' input sites ("qkv_proj[0].x", "lm_head.x"), so
+    a static spec with percentile None or 99.99 reads the same range the copies used."""
+    out: dict[str, Ranges] = {}
+    p9999 = data.get("act_amax_p99_99", {})
+    for name, amax in data["act_amax_max"].items():
+        if name in ("tok_emb", "lm_head"):
+            key = "lm_head.x"
+        else:
+            _, layer, rest = name.split(".", 2)
+            key = f"{_WEIGHT_SITE[rest]}[{int(layer)}].x"
+        r = Ranges(absmax=float(amax), percentiles={100.0: float(amax)})
+        if name in p9999:
+            r.percentiles[99.99] = float(p9999[name])
+        if key in out and (out[key].absmax != r.absmax or out[key].percentiles != r.percentiles):
+            raise ValueError(f"{name}: a different range for {key} than the other weights sharing that input")
+        out[key] = r
+    return out

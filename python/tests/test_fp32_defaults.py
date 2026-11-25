@@ -100,14 +100,21 @@ def test_full_fp32_turns_tf32_off_and_metadata_records_it():
         torch.set_float32_matmul_precision(saved["float32_matmul_precision"])
 
 
+# Format emulation, not half-precision compute: round_to_float casts a value to the format and straight
+# back to float32 (`v.to(dtype).to(v.dtype)`), so a QuantSpec(kind="float", bits=16) stage stores FP16
+# values while every operation still runs in float32.
+EMULATED_FORMATS = {"LUT/techniques.py": {"float16", "bfloat16"}}
+
+
 def test_model_code_never_uses_half_precision_or_autocast():
     forbidden = {"float16", "half", "bfloat16", "autocast", "amp"}
     problems = []
     for folder in ("baseline", "LUT", "reference", "eval", "common"):
         for path in sorted((PYTHON_DIR / folder).glob("*.py")):
+            allowed = EMULATED_FORMATS.get(path.relative_to(PYTHON_DIR).as_posix(), set())
             for node in ast.walk(ast.parse(path.read_text())):
                 name = node.attr if isinstance(node, ast.Attribute) else node.id if isinstance(node, ast.Name) else None
-                if name in forbidden:
+                if name in forbidden - allowed:
                     problems.append(f"{path.relative_to(PYTHON_DIR)}:{node.lineno}: {name}")
     assert not problems, problems
 

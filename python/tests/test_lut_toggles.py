@@ -75,7 +75,7 @@ def test_bad_toggles_fail_at_startup(dummy_arch):
         ops_registry.resolve_ops({"softmax": Stage(lut=LUTArch("typo", 1, 8, 16))}, CFG, "inference")
     with pytest.raises(ValueError, match="out of range"):
         ops_registry.resolve_ops({"softmax": Stage(lut=DUMMY, layers=(4,))}, CFG, "inference")
-    with pytest.raises(NotImplementedError, match="D4"):
+    with pytest.raises(ValueError, match="needs calibrated ranges"):    # a static scale with no CALIBRATION
         ops_registry.resolve_ops({"qkv_proj": Stage(quant=QuantSpec(bits=8))}, CFG, "inference")
 
 

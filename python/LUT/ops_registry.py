@@ -220,7 +220,7 @@ def _build(stage: str, layer: int | None, choice: Stage, base_fn: Any, cfg: base
     if mode == "train":
         return fn
     if choice.quant or choice.quant_b or choice.weight is not None or choice.smooth is not None:
-        fn = PrecisionStage(fn, stage, layer, choice, ranges)
+        fn = PrecisionStage(fn, stage, layer, choice, ranges, integer=fn is base_fn)
     if observer is not None:
         fn = ObservedStage(fn, stage, layer, observer)
     return fn
@@ -232,10 +232,18 @@ class PrecisionStage:
     input, the stage itself, then the accumulator width on its output. The techniques are bound
     and checked when the model is built; static scales, smoothing factors and prepared weights
     are computed on first use and kept (weights keyed by the tensor, so each tied copy and each
-    norm's gamma gets its own)."""
+    norm's gamma gets its own).
 
-    def __init__(self, fn: Callable, stage: str, layer: int | None, choice: Stage, ranges: Any) -> None:
+    When every input is an integer format the stage can sum exactly (techniques.integer_kernel,
+    decided here from the specs) and the stage runs its baseline function, it runs as integer
+    arithmetic instead (techniques.integer_stage): the bit-exact reference, with the accumulator
+    width applied to the integer sums. Otherwise the stage function runs on the dequantized values.
+    integer=False (a LUT or alt function in the slot) always takes the float path."""
+
+    def __init__(self, fn: Callable, stage: str, layer: int | None, choice: Stage, ranges: Any,
+                 integer: bool = True) -> None:
         self.fn, self.stage, self.layer, self.choice = fn, stage, layer, choice
+        self.integer = integer and techniques.integer_kernel(stage, choice.quant, choice.quant_b, choice.weight)
         where = stage if layer is None else f"{stage} layer {layer}"
         self.specs = [(i, spec, Site(stage, layer, OPERANDS[stage][i]))
                       for i, spec in enumerate((choice.quant, choice.quant_b)) if spec is not None]
@@ -271,9 +279,10 @@ class PrecisionStage:
         if self.choice.smooth is not None:
             s = self._smoothing(args[0])
             args[0] = args[0] / s
+        weight_float = None
         if self.choice.weight is not None or self.choice.smooth is not None:
             idx = self.weight_arg[0]
-            args[idx] = self._prepared(args[idx])
+            args[idx], weight_float = self._prepared(args[idx])
         for i, spec, site in self.specs:
             x = args[i]
             scale = self.static.get(i)
@@ -282,6 +291,18 @@ class PrecisionStage:
                 if spec.scale_mode != "dynamic":             # static or none: the same every call
                     self.static[i] = scale
             args[i] = self.quantize_input(x, spec, scale, site)
+        operands = [args[i] for i, _, _ in self.specs]
+        if self.stage in LINEAR_STAGES and self.choice.weight is not None:
+            operands.append(args[self.weight_arg[0]])
+        if self.integer and all(isinstance(a, techniques.Quantized) for a in operands):
+            if self.acc is None:
+                return techniques.integer_stage(self.stage, args, kwargs, _same)
+            site, inputs = self.specs[0][2], tuple(operands)
+            return techniques.integer_stage(self.stage, args, kwargs,
+                                            lambda acc: self.accumulator(acc, self.acc, site, inputs))
+        if weight_float is not None:
+            args[self.weight_arg[0]] = weight_float
+        args = [a.dequantize() if isinstance(a, techniques.Quantized) else a for a in args]
         y = self.fn(*args, **kwargs)
         if self.acc is not None:
             y = self.accumulator(y, self.acc, self.specs[0][2], tuple(args[i] for i, _, _ in self.specs))
@@ -294,18 +315,24 @@ class PrecisionStage:
             self.smooth_s = s.to(device=x.device, dtype=x.dtype)
         return self.smooth_s
 
-    def _prepared(self, w: Any) -> Any:
-        """The weight as this stage multiplies by it, made once per weight tensor and version."""
+    def _prepared(self, w: Any) -> tuple[Any, Any]:
+        """The weight as this stage multiplies by it, made once per weight tensor and version:
+        (as prepared, which may be a techniques.Quantized; its float values for the float path)."""
         hit = self.prepared.get(id(w))
         if hit is not None and hit[0] is w and hit[1] == w._version:
-            return hit[2]
+            return hit[2], hit[3]
         out = w
         if self.choice.smooth is not None:
             out = out * self._smoothing(w)                  # W[:, j] * s_j (columns = input channels)
         if self.choice.weight is not None:
             out = self.prepare_weight(out, self.choice.weight, Site(self.stage, self.layer, self.weight_arg[1]))
-        self.prepared[id(w)] = (w, w._version, out)
-        return out
+        as_float = out.dequantize() if isinstance(out, techniques.Quantized) else out
+        self.prepared[id(w)] = (w, w._version, out, as_float)
+        return out, as_float
+
+
+def _same(acc: Any) -> Any:
+    return acc
 
 
 class ObservedStage:
